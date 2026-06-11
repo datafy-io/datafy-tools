@@ -4,7 +4,7 @@ A fast, single-binary AWS discovery tool that inventories EBS volumes, EC2 insta
 
 ## Download
 
-Pre-built binaries for Linux, macOS, and Windows are available on the [Releases](../../releases) page.
+Pre-built binaries for Linux, macOS, and Windows are available on the [Releases](https://github.com/datafy-io/datafy-tools/releases) page.
 
 ## Build from source
 
