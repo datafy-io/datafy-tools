@@ -118,117 +118,92 @@ assume_role_env() {
 
 scan_region() {
   local account_id="$1" region="$2"
-  local scanned_at
+  local scanned_at tmp
   scanned_at=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+  tmp=$(make_tmpdir)
 
-  # Volumes
-  local volumes
-  volumes=$(aws ec2 describe-volumes \
-    --region "$region" --output json \
-    --query 'Volumes' 2>/dev/null || echo "[]")
-  volumes=$(echo "${volumes:-[]}" | jq '[.[]? | {
+  # Fire all independent API calls in parallel
+  aws ec2 describe-volumes \
+    --region "$region" --output json --query 'Volumes' \
+    2>/dev/null > "$tmp/volumes.json" || echo "[]" > "$tmp/volumes.json" &
+
+  aws ec2 describe-instances \
+    --region "$region" --output json --query 'Reservations' \
+    2>/dev/null > "$tmp/reservations.json" || echo "[]" > "$tmp/reservations.json" &
+
+  aws ec2 describe-snapshots \
+    --region "$region" --output json --owner-ids self --query 'Snapshots' \
+    2>/dev/null > "$tmp/snapshots.json" || echo "[]" > "$tmp/snapshots.json" &
+
+  aws dlm get-lifecycle-policies \
+    --region "$region" --output json --query 'Policies' \
+    2>/dev/null > "$tmp/dlm.json" || echo "[]" > "$tmp/dlm.json" &
+
+  aws backup list-backup-plans \
+    --region "$region" --output json --query 'BackupPlansList' \
+    2>/dev/null > "$tmp/backup.json" || echo "[]" > "$tmp/backup.json" &
+
+  wait
+
+  # AMIs depend on instance results — fire after instances are fetched
+  local ami_ids
+  ami_ids=$(jq -r '[.[]? | .Instances[]? | .ImageId] | unique | @sh' "$tmp/reservations.json")
+  if [[ -n "$ami_ids" && "$ami_ids" != "''" ]]; then
+    eval "aws ec2 describe-images \
+      --region \"$region\" --output json \
+      --image-ids $ami_ids \
+      --query 'Images'" 2>/dev/null > "$tmp/amis.json" || echo "[]" > "$tmp/amis.json"
+  else
+    echo "[]" > "$tmp/amis.json"
+  fi
+
+  # Transform and assemble
+  local volumes instances amis snapshots dlm_policies backup_plans
+
+  volumes=$(jq '[.[]? | {
     VolumeId,
     Name: (.Tags // [] | map(select(.Key=="Name")) | first | .Value),
-    Size,
-    VolumeType,
-    State,
-    Iops,
-    Throughput,
-    Encrypted,
-    AvailabilityZone,
-    SnapshotId,
+    Size, VolumeType, State, Iops, Throughput, Encrypted, AvailabilityZone, SnapshotId,
     InstanceId: (.Attachments // [] | first | .InstanceId),
     Device:     (.Attachments // [] | first | .Device),
     Tags: (.Tags // [])
-  }]')
+  }]' "$tmp/volumes.json")
 
-  # Instances
-  local reservations instances ami_ids
-  reservations=$(aws ec2 describe-instances \
-    --region "$region" --output json \
-    --query 'Reservations' 2>/dev/null || echo "[]")
-  instances=$(echo "${reservations:-[]}" | jq '[.[]? as $r | $r.Instances[]? | {
+  instances=$(jq '[.[]? as $r | $r.Instances[]? | {
     InstanceId,
     Name: (.Tags // [] | map(select(.Key=="Name")) | first | .Value),
-    InstanceType,
-    State: .State.Name,
-    Hypervisor,
-    PlatformDetails,
-    ImageId,
+    InstanceType, State: .State.Name, Hypervisor, PlatformDetails, ImageId,
     AvailabilityZone: .Placement.AvailabilityZone,
-    RootDeviceName,
-    Architecture,
-    OwnerId: $r.OwnerId,
+    RootDeviceName, Architecture, OwnerId: $r.OwnerId,
     Tags: (.Tags // [])
-  }]')
+  }]' "$tmp/reservations.json")
 
-  # AMIs referenced by instances
-  ami_ids=$(echo "${reservations:-[]}" | jq -r '[.[]? | .Instances[]? | .ImageId] | unique | @sh')
-  local amis="[]"
-  if [[ -n "$ami_ids" && "$ami_ids" != "''" ]]; then
-    amis=$(eval "aws ec2 describe-images \
-      --region \"$region\" --output json \
-      --image-ids $ami_ids \
-      --query 'Images'" 2>/dev/null || echo "[]")
-    amis=$(echo "${amis:-[]}" | jq '[.[]? | {
-      ImageId,
-      Name,
-      Description,
-      Platform: (.Platform // ""),
-      Architecture
-    }]')
-  fi
+  amis=$(jq '[.[]? | {
+    ImageId, Name, Description,
+    Platform: (.Platform // ""),
+    Architecture
+  }]' "$tmp/amis.json")
 
-  # Snapshots
-  local snapshots
-  snapshots=$(aws ec2 describe-snapshots \
-    --region "$region" --output json \
-    --owner-ids self \
-    --query 'Snapshots' 2>/dev/null || echo "[]")
-  snapshots=$(echo "${snapshots:-[]}" | jq '[.[]? | {
-    SnapshotId,
-    VolumeId,
-    VolumeSize,
-    StartTime,
-    State,
-    Encrypted,
+  snapshots=$(jq '[.[]? | {
+    SnapshotId, VolumeId, VolumeSize, StartTime, State, Encrypted,
     Tags: (.Tags // [])
-  }]')
+  }]' "$tmp/snapshots.json")
 
-  # DLM policies
-  local dlm_policies
-  dlm_policies=$(aws dlm get-lifecycle-policies \
-    --region "$region" --output json \
-    --query 'Policies' 2>/dev/null || echo "[]")
-  dlm_policies=$(echo "${dlm_policies:-[]}" | jq '[.[]? | {
-    PolicyId,
-    Description,
-    State,
-    PolicyType
-  }]')
+  dlm_policies=$(jq '[.[]? | {PolicyId, Description, State, PolicyType}]' "$tmp/dlm.json")
+  backup_plans=$(jq '[.[]? | {BackupPlanId, BackupPlanName, CreationDate}]'  "$tmp/backup.json")
 
-  # AWS Backup plans
-  local backup_plans
-  backup_plans=$(aws backup list-backup-plans \
-    --region "$region" --output json \
-    --query 'BackupPlansList' 2>/dev/null || echo "[]")
-  backup_plans=$(echo "${backup_plans:-[]}" | jq '[.[]? | {
-    BackupPlanId,
-    BackupPlanName,
-    CreationDate
-  }]')
+  rm -rf "$tmp"
 
-  # Emit one JSON object
   jq -nc \
-    --arg account_id    "$account_id" \
-    --arg region        "$region" \
-    --arg scanned_at    "$scanned_at" \
-    --argjson volumes       "$volumes" \
-    --argjson instances     "$instances" \
-    --argjson amis          "$amis" \
-    --argjson snapshots     "$snapshots" \
-    --argjson dlm_policies  "$dlm_policies" \
-    --argjson backup_plans  "$backup_plans" \
+    --arg     account_id   "$account_id" \
+    --arg     region       "$region" \
+    --arg     scanned_at   "$scanned_at" \
+    --argjson volumes      "$volumes" \
+    --argjson instances    "$instances" \
+    --argjson amis         "$amis" \
+    --argjson snapshots    "$snapshots" \
+    --argjson dlm_policies "$dlm_policies" \
+    --argjson backup_plans "$backup_plans" \
     '{account_id: $account_id, region: $region, scanned_at: $scanned_at,
       volumes: $volumes, instances: $instances, amis: $amis,
       snapshots: $snapshots, dlm_policies: $dlm_policies, backup_plans: $backup_plans}'
