@@ -50,6 +50,66 @@ All three tools share the same interface:
 --include    IDS    Comma-separated account IDs to scan
 --exclude    IDS    Comma-separated account IDs to skip
 --output     FILE   Output file (default: discovery_<timestamp>.json)
+--version           Print version and exit
+```
+
+## IAM permissions
+
+### Management account (where you run the tool)
+
+The identity you run the tool with needs:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": [
+        "organizations:ListAccounts",
+        "organizations:ListAccountsForParent",
+        "organizations:ListRoots",
+        "sts:AssumeRole"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Effect": "Allow",
+      "Action": [
+        "cloudformation:CreateStackSet",
+        "cloudformation:CreateStackInstances",
+        "cloudformation:DeleteStackInstances",
+        "cloudformation:DeleteStackSet",
+        "cloudformation:DescribeStackSetOperation"
+      ],
+      "Resource": "*"
+    }
+  ]
+}
+```
+
+The CloudFormation permissions are only required when using `--setup-role`.
+
+### Child account role (`--setup-role`)
+
+When you pass `--setup-role`, the tool uses a CloudFormation StackSet to deploy a read-only IAM role (`DatafyDiscoveryRole`) to every target account. The role is automatically deleted after the scan.
+
+The deployed role grants:
+
+| Statement | Actions | Resource | Notes |
+|-----------|---------|----------|-------|
+| `EC2DescribeReadOnly` | `ec2:DescribeVolumes`, `ec2:DescribeInstances`, `ec2:DescribeRegions`, `ec2:DescribeImages`, `ec2:DescribeSnapshots` | `*` | EC2 Describe APIs do not support resource-level permissions in IAM — `*` is required by AWS |
+| `DLMPoliciesReadOnly` | `dlm:GetLifecyclePolicies` | `arn:aws:dlm:*:*:policy/*` | Scoped to DLM lifecycle policies only |
+| `BackupPlansReadOnly` | `backup:ListBackupPlans` | `arn:aws:backup:*:*:backup-plan:*` | Scoped to Backup plans only |
+
+The role can only be assumed by the management account (`arn:aws:iam::<mgmt-account>:root`) and has no write permissions.
+
+### Bring your own role
+
+Skip `--setup-role` and use `--role` to specify an existing role that already has the permissions above:
+
+```bash
+./discovery --profile myprofile --role MyExistingReadOnlyRole
 ```
 
 ## Output format

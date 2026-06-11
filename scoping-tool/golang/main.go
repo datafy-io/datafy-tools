@@ -40,7 +40,7 @@ import (
 // ── Constants ──────────────────────────────────────────────────────────────────
 
 const (
-	version           = "0.1.0"
+	version           = "0.1.1"
 	defaultRoleName   = "OrganizationAccountAccessRole"
 	discoveryRoleName = "DatafyDiscoveryRole"
 	stackSetName      = "DatafyDiscovery"
@@ -71,11 +71,29 @@ const discoveryRoleTemplate = `{
         },
         "Policies": [{ "PolicyName": "DatafyDiscovery", "PolicyDocument": {
           "Version": "2012-10-17",
-          "Statement": [{ "Effect": "Allow", "Resource": "*", "Action": [
-            "ec2:DescribeVolumes", "ec2:DescribeInstances", "ec2:DescribeRegions",
-            "ec2:DescribeImages", "ec2:DescribeSnapshots",
-            "dlm:GetLifecyclePolicies", "backup:ListBackupPlans"
-          ]}]
+          "Statement": [
+            {
+              "Sid": "EC2DescribeReadOnly",
+              "Effect": "Allow",
+              "Resource": "*",
+              "Action": [
+                "ec2:DescribeVolumes", "ec2:DescribeInstances", "ec2:DescribeRegions",
+                "ec2:DescribeImages", "ec2:DescribeSnapshots"
+              ]
+            },
+            {
+              "Sid": "DLMPoliciesReadOnly",
+              "Effect": "Allow",
+              "Resource": "arn:aws:dlm:*:*:policy/*",
+              "Action": ["dlm:GetLifecyclePolicies"]
+            },
+            {
+              "Sid": "BackupPlansReadOnly",
+              "Effect": "Allow",
+              "Resource": "arn:aws:backup:*:*:backup-plan:*",
+              "Action": ["backup:ListBackupPlans"]
+            }
+          ]
         }}]
       }
     }

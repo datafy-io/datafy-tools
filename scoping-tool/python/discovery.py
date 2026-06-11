@@ -32,7 +32,7 @@ import boto3
 from botocore.exceptions import ClientError, NoCredentialsError, PartialCredentialsError
 
 # ── Configuration ──────────────────────────────────────────────────────────────
-VERSION             = "0.1.0"
+VERSION             = "0.1.1"
 DEFAULT_ROLE_NAME   = "OrganizationAccountAccessRole"
 DISCOVERY_ROLE_NAME = "DatafyDiscoveryRole"
 STACKSET_NAME       = "DatafyDiscovery"
@@ -74,19 +74,32 @@ DISCOVERY_ROLE_TEMPLATE = json.dumps({
                     "PolicyName": "DatafyDiscovery",
                     "PolicyDocument": {
                         "Version": "2012-10-17",
-                        "Statement": [{
-                            "Effect": "Allow",
-                            "Action": [
-                                "ec2:DescribeVolumes",
-                                "ec2:DescribeInstances",
-                                "ec2:DescribeRegions",
-                                "ec2:DescribeImages",
-                                "ec2:DescribeSnapshots",
-                                "dlm:GetLifecyclePolicies",
-                                "backup:ListBackupPlans",
-                            ],
-                            "Resource": "*",
-                        }],
+                        "Statement": [
+                            {
+                                "Sid": "EC2DescribeReadOnly",
+                                "Effect": "Allow",
+                                "Resource": "*",
+                                "Action": [
+                                    "ec2:DescribeVolumes",
+                                    "ec2:DescribeInstances",
+                                    "ec2:DescribeRegions",
+                                    "ec2:DescribeImages",
+                                    "ec2:DescribeSnapshots",
+                                ],
+                            },
+                            {
+                                "Sid": "DLMPoliciesReadOnly",
+                                "Effect": "Allow",
+                                "Resource": "arn:aws:dlm:*:*:policy/*",
+                                "Action": ["dlm:GetLifecyclePolicies"],
+                            },
+                            {
+                                "Sid": "BackupPlansReadOnly",
+                                "Effect": "Allow",
+                                "Resource": "arn:aws:backup:*:*:backup-plan:*",
+                                "Action": ["backup:ListBackupPlans"],
+                            },
+                        ],
                     },
                 }],
             },
