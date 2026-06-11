@@ -64,16 +64,26 @@ The identity you run the tool with needs:
   "Version": "2012-10-17",
   "Statement": [
     {
+      "Sid": "OrganizationsReadOnly",
       "Effect": "Allow",
       "Action": [
         "organizations:ListAccounts",
         "organizations:ListAccountsForParent",
-        "organizations:ListRoots",
-        "sts:AssumeRole"
+        "organizations:ListRoots"
       ],
       "Resource": "*"
     },
     {
+      "Sid": "AssumeDiscoveryRoles",
+      "Effect": "Allow",
+      "Action": "sts:AssumeRole",
+      "Resource": [
+        "arn:aws:iam::*:role/OrganizationAccountAccessRole",
+        "arn:aws:iam::*:role/DatafyDiscoveryRole"
+      ]
+    },
+    {
+      "Sid": "StackSetManagement",
       "Effect": "Allow",
       "Action": [
         "cloudformation:CreateStackSet",
@@ -82,13 +92,17 @@ The identity you run the tool with needs:
         "cloudformation:DeleteStackSet",
         "cloudformation:DescribeStackSetOperation"
       ],
-      "Resource": "*"
+      "Resource": "arn:aws:cloudformation:*:*:stackset/DatafyDiscovery:*"
     }
   ]
 }
 ```
 
-The CloudFormation permissions are only required when using `--setup-role`.
+Notes:
+- `organizations:List*` actions do not support resource-level permissions in IAM — `*` is required by AWS.
+- `sts:AssumeRole` is scoped to the two role names the tool uses. If you override `--role MyCustomRole`, add `arn:aws:iam::*:role/MyCustomRole` to that resource list.
+- `StackSetManagement` is scoped to the `DatafyDiscovery` StackSet created by `--setup-role` only.
+- The `StackSetManagement` statement is only required when using `--setup-role`.
 
 ### Child account role (`--setup-role`)
 
