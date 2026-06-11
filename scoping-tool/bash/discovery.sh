@@ -6,6 +6,9 @@
 # Compatible with: bash 3.2+ (macOS default), bash 4/5, zsh
 set -euo pipefail
 
+# Disable AWS CLI v2 pager — prevents interactive prompts in scripts
+export AWS_PAGER=""
+
 # ── Constants ──────────────────────────────────────────────────────────────────
 
 DEFAULT_ROLE="OrganizationAccountAccessRole"
