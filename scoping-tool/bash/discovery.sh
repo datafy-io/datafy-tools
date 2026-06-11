@@ -100,7 +100,7 @@ aws_cmd() {
   fi
 }
 
-# Set MAX_ACCOUNT_JOBS and MAX_REGION_JOBS using 30% of available RAM.
+# Set MAX_ACCOUNT_JOBS and MAX_REGION_JOBS using 70% of available RAM.
 # Each aws CLI v2 process uses ~125MB. Peak = MAX_ACCOUNT_JOBS × MAX_REGION_JOBS processes.
 set_job_limits() {
   local free_mb=0
@@ -119,7 +119,7 @@ set_job_limits() {
   fi
 
   if (( free_mb > 0 )); then
-    local budget_mb=$(( free_mb * 30 / 100 ))
+    local budget_mb=$(( free_mb * 70 / 100 ))
     local total_jobs=$(( budget_mb / 125 ))
     (( total_jobs < 2  )) && total_jobs=2
     (( total_jobs > 40 )) && total_jobs=40
@@ -128,7 +128,7 @@ set_job_limits() {
     (( MAX_ACCOUNT_JOBS < 1 )) && MAX_ACCOUNT_JOBS=1
     MAX_REGION_JOBS=$(( total_jobs / MAX_ACCOUNT_JOBS ))
     (( MAX_REGION_JOBS < 1 )) && MAX_REGION_JOBS=1
-    log "Available RAM: ${free_mb}MB  Budget (30%%): ${budget_mb}MB  Jobs: ${MAX_ACCOUNT_JOBS} accounts × ${MAX_REGION_JOBS} regions"
+    log "Available RAM: ${free_mb}MB  Budget (70%%): ${budget_mb}MB  Jobs: ${MAX_ACCOUNT_JOBS} accounts × ${MAX_REGION_JOBS} regions"
   else
     log "Could not detect available RAM — using defaults (${MAX_ACCOUNT_JOBS} accounts × ${MAX_REGION_JOBS} regions)"
   fi
