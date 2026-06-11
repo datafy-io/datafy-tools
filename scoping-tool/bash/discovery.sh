@@ -507,13 +507,25 @@ log "Management account: $CALLER_ACCOUNT"
 
 set_job_limits
 
-# Single EXIT trap — handles both StackSet teardown and lock file cleanup
+# Single EXIT trap — handles StackSet teardown and lock file cleanup
 TEARDOWN_STACKSET=false
 cleanup() {
   rm -f "${OUTPUT}.lock"
   [[ "$TEARDOWN_STACKSET" == true ]] && teardown_stackset "$OU" "$INCLUDE"
 }
 trap cleanup EXIT
+
+# Ctrl+C / SIGTERM: kill all background jobs then exit (EXIT trap handles the rest)
+handle_interrupt() {
+  log ""
+  log "Interrupted — stopping all scans..."
+  local pids
+  pids=$(jobs -p 2>/dev/null) || true
+  [[ -n "$pids" ]] && echo "$pids" | xargs kill -TERM 2>/dev/null || true
+  wait 2>/dev/null || true
+  exit 130
+}
+trap handle_interrupt INT TERM
 
 # Deploy StackSet if requested
 if [[ "$SETUP_ROLE" == true ]]; then
