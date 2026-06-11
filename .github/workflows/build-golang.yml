@@ -1,15 +1,15 @@
-name: Build Go Binary
+name: Build and Release
 
 on:
   push:
     branches: [main]
     paths:
-      - "scoping-tool/golang/**"
+      - "scoping-tool/**"
     tags:
       - "v*"
   pull_request:
     paths:
-      - "scoping-tool/golang/**"
+      - "scoping-tool/**"
 
 jobs:
   build:
@@ -68,15 +68,25 @@ jobs:
       contents: write
 
     steps:
+      - uses: actions/checkout@v4
+
       - uses: actions/download-artifact@v4
         with:
           path: artifacts
           merge-multiple: true
 
+      - name: Stage release assets
+        run: |
+          cp scoping-tool/bash/discovery.sh    artifacts/discovery.sh
+          cp scoping-tool/python/discovery.py  artifacts/discovery.py
+
       - name: Create GitHub release
         uses: softprops/action-gh-release@v2
         with:
-          files: artifacts/discovery-*
+          files: |
+            artifacts/discovery-*
+            artifacts/discovery.sh
+            artifacts/discovery.py
           generate_release_notes: true
           body: |
             ## Datafy Discovery Tool ${{ github.ref_name }}
@@ -85,25 +95,29 @@ jobs:
 
             ## Download
 
-            | Platform | Binary |
-            |----------|--------|
-            | Linux x86-64 | `discovery-linux-amd64` |
-            | Linux ARM64 | `discovery-linux-arm64` |
-            | macOS x86-64 | `discovery-darwin-amd64` |
-            | macOS Apple Silicon | `discovery-darwin-arm64` |
-            | Windows x86-64 | `discovery-windows-amd64.exe` |
+            | Tool | File | Requirements |
+            |------|------|--------------|
+            | Go — Linux x86-64 | `discovery-linux-amd64` | none |
+            | Go — Linux ARM64 | `discovery-linux-arm64` | none |
+            | Go — macOS x86-64 | `discovery-darwin-amd64` | none |
+            | Go — macOS Apple Silicon | `discovery-darwin-arm64` | none |
+            | Go — Windows x86-64 | `discovery-windows-amd64.exe` | none |
+            | Bash | `discovery.sh` | aws-cli v2, jq |
+            | Python | `discovery.py` | Python 3.8+, boto3 |
 
             ## Quick start
 
             ```bash
-            # Scan all accounts in the org
-            ./discovery -profile myprofile
+            # Go
+            ./discovery-darwin-arm64 --profile myprofile --setup-role
 
-            # Deploy a minimal read-only role via StackSet, scan, then auto-teardown
-            ./discovery -profile myprofile -setup-role
+            # Bash
+            chmod +x discovery.sh
+            ./discovery.sh --profile myprofile --setup-role
 
-            # Scan a specific OU
-            ./discovery -profile myprofile -ou ou-ab12-xxxxxxxx
+            # Python
+            pip install boto3
+            python3 discovery.py --profile myprofile --setup-role
             ```
 
-            See the [README](https://github.com/datafy-io/datafy-tools/blob/main/scoping-tool/golang/README.md) for full usage.
+            See the [README](https://github.com/datafy-io/datafy-tools/blob/main/scoping-tool/README.md) for full usage.
