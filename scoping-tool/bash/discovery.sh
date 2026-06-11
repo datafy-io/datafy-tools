@@ -497,6 +497,7 @@ log "Accounts to scan: ${#ACCOUNTS[@]}"
 [[ -z "$OUTPUT" ]] && OUTPUT="discovery_$(date -u +%Y%m%d_%H%M%S).json"
 > "$OUTPUT"
 touch "${OUTPUT}.lock"
+trap 'rm -f "${OUTPUT}.lock"' EXIT
 
 # Scan accounts in parallel, capped at MAX_ACCOUNT_JOBS.
 # Uses only plain arrays and per-PID wait — compatible with bash 3.2 and zsh.
