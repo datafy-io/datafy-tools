@@ -14,10 +14,8 @@ export AWS_PAGER=""
 DEFAULT_ROLE="OrganizationAccountAccessRole"
 DISCOVERY_ROLE="DatafyDiscoveryRole"
 STACKSET_NAME="DatafyDiscovery"
-# Each aws CLI call is a Python process (~60MB RAM).
-# MAX_ACCOUNT_JOBS × MAX_REGION_JOBS × 5 = peak concurrent processes.
-# 4 × 4 × 5 = 80 processes (~5GB peak) — safe for most laptops.
-MAX_ACCOUNT_JOBS=4
+# Parallelism — sized dynamically at runtime from available RAM (see set_job_limits below).
+MAX_ACCOUNT_JOBS=3
 MAX_REGION_JOBS=4
 
 DISCOVERY_ROLE_TEMPLATE='{
@@ -102,6 +100,40 @@ aws_cmd() {
   fi
 }
 
+# Set MAX_ACCOUNT_JOBS and MAX_REGION_JOBS using 30% of available RAM.
+# Each aws CLI v2 process uses ~125MB. Peak = MAX_ACCOUNT_JOBS × MAX_REGION_JOBS processes.
+set_job_limits() {
+  local free_mb=0
+
+  if [[ "$(uname)" == "Darwin" ]]; then
+    # macOS: use vm_stat to get free+inactive pages (4KB each)
+    local pages
+    pages=$(vm_stat 2>/dev/null | awk '
+      /Pages free/      { gsub(/\./, "", $3); free += $3 }
+      /Pages inactive/  { gsub(/\./, "", $3); free += $3 }
+      END { print free }')
+    free_mb=$(( ${pages:-0} * 4 / 1024 ))
+  elif [[ -f /proc/meminfo ]]; then
+    # Linux: MemAvailable is the most accurate "usable" figure
+    free_mb=$(awk '/MemAvailable/ { printf "%d", $2/1024 }' /proc/meminfo)
+  fi
+
+  if (( free_mb > 0 )); then
+    local budget_mb=$(( free_mb * 30 / 100 ))
+    local total_jobs=$(( budget_mb / 125 ))
+    (( total_jobs < 2  )) && total_jobs=2
+    (( total_jobs > 40 )) && total_jobs=40
+    # Split evenly: account jobs ≈ sqrt(total), region jobs fills the rest
+    MAX_ACCOUNT_JOBS=$(( total_jobs / 4 ))
+    (( MAX_ACCOUNT_JOBS < 1 )) && MAX_ACCOUNT_JOBS=1
+    MAX_REGION_JOBS=$(( total_jobs / MAX_ACCOUNT_JOBS ))
+    (( MAX_REGION_JOBS < 1 )) && MAX_REGION_JOBS=1
+    log "Available RAM: ${free_mb}MB  Budget (30%%): ${budget_mb}MB  Jobs: ${MAX_ACCOUNT_JOBS} accounts × ${MAX_REGION_JOBS} regions"
+  else
+    log "Could not detect available RAM — using defaults (${MAX_ACCOUNT_JOBS} accounts × ${MAX_REGION_JOBS} regions)"
+  fi
+}
+
 # Assume a role and print export statements the caller can eval.
 assume_role_env() {
   local account_id="$1" role_name="$2"
@@ -126,30 +158,28 @@ scan_region() {
   scanned_at=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
   tmp=$(make_tmpdir)
 
-  # Fire all independent API calls in parallel
+  # API calls are sequential within a region — parallelism happens at the region/account level.
+  # Running them in parallel here multiplied peak process count by 5x and exhausted RAM.
   aws ec2 describe-volumes \
     --region "$region" --output json --query 'Volumes' \
-    2>/dev/null > "$tmp/volumes.json" || echo "[]" > "$tmp/volumes.json" &
+    2>/dev/null > "$tmp/volumes.json"      || echo "[]" > "$tmp/volumes.json"
 
   aws ec2 describe-instances \
     --region "$region" --output json --query 'Reservations' \
-    2>/dev/null > "$tmp/reservations.json" || echo "[]" > "$tmp/reservations.json" &
+    2>/dev/null > "$tmp/reservations.json" || echo "[]" > "$tmp/reservations.json"
 
   aws ec2 describe-snapshots \
     --region "$region" --output json --owner-ids self --query 'Snapshots' \
-    2>/dev/null > "$tmp/snapshots.json" || echo "[]" > "$tmp/snapshots.json" &
+    2>/dev/null > "$tmp/snapshots.json"    || echo "[]" > "$tmp/snapshots.json"
 
   aws dlm get-lifecycle-policies \
     --region "$region" --output json --query 'Policies' \
-    2>/dev/null > "$tmp/dlm.json" || echo "[]" > "$tmp/dlm.json" &
+    2>/dev/null > "$tmp/dlm.json"          || echo "[]" > "$tmp/dlm.json"
 
   aws backup list-backup-plans \
     --region "$region" --output json --query 'BackupPlansList' \
-    2>/dev/null > "$tmp/backup.json" || echo "[]" > "$tmp/backup.json" &
+    2>/dev/null > "$tmp/backup.json"       || echo "[]" > "$tmp/backup.json"
 
-  wait
-
-  # AMIs depend on instance results — fire after instances are fetched
   local ami_ids
   ami_ids=$(jq -r '[.[]? | .Instances[]? | .ImageId] | unique | @sh' "$tmp/reservations.json")
   if [[ -n "$ami_ids" && "$ami_ids" != "''" ]]; then
@@ -474,6 +504,8 @@ CALLER_ARN=$(echo "$IDENTITY"     | jq -r '.Arn')
 
 log "Running as:         $CALLER_ARN"
 log "Management account: $CALLER_ACCOUNT"
+
+set_job_limits
 
 # Single EXIT trap — handles both StackSet teardown and lock file cleanup
 TEARDOWN_STACKSET=false
