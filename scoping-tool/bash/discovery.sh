@@ -506,7 +506,7 @@ throttle_jobs() {
   # Remove finished PIDs from active_pids
   local remaining=()
   local pid
-  for pid in "${active_pids[@]}"; do
+  for pid in "${active_pids[@]+"${active_pids[@]}"}"; do
     kill -0 "$pid" 2>/dev/null && remaining+=("$pid") || true
   done
   active_pids=("${remaining[@]+"${remaining[@]}"}")
@@ -515,21 +515,21 @@ throttle_jobs() {
   while (( ${#active_pids[@]} >= MAX_ACCOUNT_JOBS )); do
     sleep 0.5
     remaining=()
-    for pid in "${active_pids[@]}"; do
+    for pid in "${active_pids[@]+"${active_pids[@]}"}"; do
       kill -0 "$pid" 2>/dev/null && remaining+=("$pid") || true
     done
     active_pids=("${remaining[@]+"${remaining[@]}"}")
   done
 }
 
-for account in "${ACCOUNTS[@]}"; do
+for account in "${ACCOUNTS[@]+"${ACCOUNTS[@]}"}"; do
   throttle_jobs
   scan_account "$account" "$CALLER_ACCOUNT" "$ROLE" "$OUTPUT" &
   active_pids+=($!)
 done
 
 # Wait for all remaining jobs
-for pid in "${active_pids[@]}"; do
+for pid in "${active_pids[@]+"${active_pids[@]}"}"; do
   wait "$pid" 2>/dev/null || true
 done
 
