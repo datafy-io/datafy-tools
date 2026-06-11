@@ -40,6 +40,7 @@ import (
 // ── Constants ──────────────────────────────────────────────────────────────────
 
 const (
+	version           = "0.1.0"
 	defaultRoleName   = "OrganizationAccountAccessRole"
 	discoveryRoleName = "DatafyDiscoveryRole"
 	stackSetName      = "DatafyDiscovery"
@@ -612,6 +613,7 @@ func teardownStackSet(ctx context.Context, cfg aws.Config, ou string, include []
 // ── Entry point ────────────────────────────────────────────────────────────────
 
 func main() {
+	versionFlag   := flag.Bool("version",     false,           "Show version")
 	profileFlag   := flag.String("profile",    "",              "AWS named profile (~/.aws/config)")
 	roleFlag      := flag.String("role",       defaultRoleName, "IAM role to assume in child accounts")
 	setupRoleFlag := flag.Bool("setup-role",   false,           "Deploy read-only role via StackSet; auto-removed after scan")
@@ -620,6 +622,11 @@ func main() {
 	excludeFlag   := flag.String("exclude",    "",              "Comma-separated account IDs to skip")
 	outputFlag    := flag.String("output",     "",              "Output file (default: discovery_<timestamp>.json)")
 	flag.Parse()
+
+	if *versionFlag {
+		fmt.Printf("Datafy Discovery Tool v%s\n", version)
+		os.Exit(0)
+	}
 
 	var include []string
 	if *includeFlag != "" {
@@ -649,6 +656,7 @@ func main() {
 	}
 
 	callerAccountId := aws.ToString(identity.Account)
+	fmt.Printf("Datafy Discovery Tool v%s\n", version)
 	fmt.Printf("Running as:         %s\n", aws.ToString(identity.Arn))
 	fmt.Printf("Management account: %s\n", callerAccountId)
 

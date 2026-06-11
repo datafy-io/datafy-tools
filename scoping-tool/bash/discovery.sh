@@ -11,6 +11,7 @@ export AWS_PAGER=""
 
 # ── Constants ──────────────────────────────────────────────────────────────────
 
+VERSION="0.1.0"
 DEFAULT_ROLE="OrganizationAccountAccessRole"
 DISCOVERY_ROLE="DatafyDiscoveryRole"
 STACKSET_NAME="DatafyDiscovery"
@@ -52,6 +53,8 @@ DISCOVERY_ROLE_TEMPLATE='{
 
 usage() {
   cat <<EOF
+Datafy Discovery Tool v${VERSION}
+
 Usage: $(basename "$0") [options]
 
 Options:
@@ -62,6 +65,7 @@ Options:
   --include    IDS    Comma-separated account IDs to scan
   --exclude    IDS    Comma-separated account IDs to skip
   --output     FILE   Output file (default: discovery_<timestamp>.json)
+  --version           Show version
   --help              Show this help
 EOF
   exit 0
@@ -481,6 +485,7 @@ while [[ $# -gt 0 ]]; do
     --include)    INCLUDE="$2";     shift 2 ;;
     --exclude)    EXCLUDE="$2";     shift 2 ;;
     --output)     OUTPUT="$2";      shift 2 ;;
+    --version)    echo "Datafy Discovery Tool v${VERSION}"; exit 0 ;;
     --help|-h)    usage ;;
     *) fail "Unknown option: $1" ;;
   esac
@@ -502,6 +507,7 @@ IDENTITY=$(aws_cmd sts get-caller-identity --output json 2>/dev/null) || \
 CALLER_ACCOUNT=$(echo "$IDENTITY" | jq -r '.Account')
 CALLER_ARN=$(echo "$IDENTITY"     | jq -r '.Arn')
 
+log "Datafy Discovery Tool v${VERSION}"
 log "Running as:         $CALLER_ARN"
 log "Management account: $CALLER_ACCOUNT"
 

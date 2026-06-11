@@ -32,6 +32,7 @@ import boto3
 from botocore.exceptions import ClientError, NoCredentialsError, PartialCredentialsError
 
 # ── Configuration ──────────────────────────────────────────────────────────────
+VERSION             = "0.1.0"
 DEFAULT_ROLE_NAME   = "OrganizationAccountAccessRole"
 DISCOVERY_ROLE_NAME = "DatafyDiscoveryRole"
 STACKSET_NAME       = "DatafyDiscovery"
@@ -377,12 +378,13 @@ def teardown_stackset(ou, include):
 def main():
     parser = argparse.ArgumentParser(
         description=(
-            "Datafy Discovery Tool — inventories EBS volumes and EC2 instances "
+            f"Datafy Discovery Tool v{VERSION} — inventories EBS volumes and EC2 instances "
             "across AWS accounts. Read-only. Safe to run in production."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
+    parser.add_argument("--version", action="version", version=f"Datafy Discovery Tool v{VERSION}")
     parser.add_argument(
         "--setup-role", action="store_true",
         help=(
@@ -426,6 +428,7 @@ def main():
         sys.exit(1)
 
     caller_account_id = identity["Account"]
+    log(f"Datafy Discovery Tool v{VERSION}")
     log(f"Running as:          {identity['Arn']}")
     log(f"Management account:  {caller_account_id}")
 
