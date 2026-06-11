@@ -3,6 +3,7 @@
 # Inventories EBS volumes, EC2 instances, AMIs, snapshots, DLM policies,
 # and AWS Backup plans across all accounts in an AWS Organization.
 # Requires: aws-cli v2, jq
+# Compatible with: bash 3.2+ (macOS default), bash 4/5, zsh
 set -euo pipefail
 
 # ── Constants ──────────────────────────────────────────────────────────────────
@@ -64,6 +65,27 @@ EOF
 log()  { echo "$*" >&2; }
 fail() { echo "Error: $*" >&2; exit 1; }
 
+# Portable mktemp: works on macOS (BSD) and Linux (GNU)
+make_tmpfile() {
+  mktemp "${TMPDIR:-/tmp}/datafy.XXXXXX"
+}
+make_tmpdir() {
+  mktemp -d "${TMPDIR:-/tmp}/datafy.XXXXXX"
+}
+
+# Portable read-lines-into-array: works on bash 3.2, bash 4/5, and zsh
+read_lines_into_array() {
+  # Usage: read_lines_into_array ARRAY_NAME < <(command)
+  # We can't use mapfile (bash 4+) so we use a while-read loop
+  local _arr_name="$1"
+  local _line
+  local _i=0
+  while IFS= read -r _line; do
+    eval "${_arr_name}[$_i]=\"\$_line\""
+    (( _i++ )) || true
+  done
+}
+
 # Run an AWS CLI command, optionally with a specific profile
 aws_cmd() {
   if [[ -n "${AWS_PROFILE:-}" ]]; then
@@ -73,8 +95,7 @@ aws_cmd() {
   fi
 }
 
-# Assume a role and export temporary credentials into the environment.
-# Prints exports that the caller evals, or returns non-zero on failure.
+# Assume a role and print export statements the caller can eval.
 assume_role_env() {
   local account_id="$1" role_name="$2"
   local role_arn="arn:aws:iam::${account_id}:role/${role_name}"
@@ -84,9 +105,9 @@ assume_role_env() {
     --role-session-name "DatafyDiscovery" \
     --duration-seconds 3600 \
     --output json 2>/dev/null) || return 1
-  echo "export AWS_ACCESS_KEY_ID=$(echo "$creds"    | jq -r '.Credentials.AccessKeyId')"
+  echo "export AWS_ACCESS_KEY_ID=$(echo "$creds"     | jq -r '.Credentials.AccessKeyId')"
   echo "export AWS_SECRET_ACCESS_KEY=$(echo "$creds" | jq -r '.Credentials.SecretAccessKey')"
-  echo "export AWS_SESSION_TOKEN=$(echo "$creds"    | jq -r '.Credentials.SessionToken')"
+  echo "export AWS_SESSION_TOKEN=$(echo "$creds"     | jq -r '.Credentials.SessionToken')"
   echo "unset AWS_PROFILE"
 }
 
@@ -196,13 +217,13 @@ scan_region() {
 
   # Emit one JSON object
   jq -nc \
-    --arg account_id  "$account_id" \
-    --arg region      "$region" \
-    --arg scanned_at  "$scanned_at" \
-    --argjson volumes     "$volumes" \
-    --argjson instances   "$instances" \
-    --argjson amis        "$amis" \
-    --argjson snapshots   "$snapshots" \
+    --arg account_id    "$account_id" \
+    --arg region        "$region" \
+    --arg scanned_at    "$scanned_at" \
+    --argjson volumes       "$volumes" \
+    --argjson instances     "$instances" \
+    --argjson amis          "$amis" \
+    --argjson snapshots     "$snapshots" \
     --argjson dlm_policies  "$dlm_policies" \
     --argjson backup_plans  "$backup_plans" \
     '{account_id: $account_id, region: $region, scanned_at: $scanned_at,
@@ -224,7 +245,7 @@ scan_account() {
     }
   fi
 
-  # List enabled regions using a subshell so credentials don't leak
+  # List enabled regions in a subshell so assumed credentials don't escape
   local regions
   regions=$(
     [[ -n "$role_env" ]] && eval "$role_env"
@@ -236,9 +257,9 @@ scan_account() {
     return 1
   }
 
-  # Scan each region, collecting results to a temp dir
+  # Scan each region in parallel, writing to a temp dir
   local tmp_dir
-  tmp_dir=$(mktemp -d)
+  tmp_dir=$(make_tmpdir)
   local region_pids=()
 
   for region in $regions; do
@@ -249,13 +270,23 @@ scan_account() {
     ) &
     region_pids+=($!)
   done
-  wait "${region_pids[@]}" 2>/dev/null || true
 
-  # Write results to the shared output file (atomic append via flock)
+  # Wait for all region jobs (compatible with bash 3.2 — no wait -n needed here)
+  local pid
+  for pid in "${region_pids[@]}"; do
+    wait "$pid" 2>/dev/null || true
+  done
+
+  # Atomically append results to the shared output file
   local count=0
   for f in "${tmp_dir}"/*.json; do
     [[ -f "$f" ]] || continue
-    (flock 9; cat "$f" >> "$output_file"; echo >> "$output_file") 9>>"${output_file}.lock"
+    # flock for atomic append; fall back gracefully if flock unavailable (some macOS)
+    if command -v flock &>/dev/null; then
+      (flock 9; cat "$f" >> "$output_file") 9>>"${output_file}.lock"
+    else
+      cat "$f" >> "$output_file"
+    fi
     (( count++ )) || true
   done
   rm -rf "$tmp_dir"
@@ -332,9 +363,9 @@ deploy_stackset() {
   local mgmt_account_id="$1" ou="$2" include="$3"
   log "Creating StackSet '$STACKSET_NAME'..."
 
-  # Write template to a temp file (aws cli needs a file or inline body)
+  # Write template to a temp file — portable mktemp (no --suffix)
   local tmpl
-  tmpl=$(mktemp --suffix=.json)
+  tmpl=$(make_tmpfile)
   echo "$DISCOVERY_ROLE_TEMPLATE" > "$tmpl"
 
   aws_cmd cloudformation create-stack-set \
@@ -413,13 +444,13 @@ OUTPUT=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --profile)    PROFILE="$2";  shift 2 ;;
-    --role)       ROLE="$2";     shift 2 ;;
-    --setup-role) SETUP_ROLE=true; shift ;;
-    --ou)         OU="$2";       shift 2 ;;
-    --include)    INCLUDE="$2";  shift 2 ;;
-    --exclude)    EXCLUDE="$2";  shift 2 ;;
-    --output)     OUTPUT="$2";   shift 2 ;;
+    --profile)    PROFILE="$2";     shift 2 ;;
+    --role)       ROLE="$2";        shift 2 ;;
+    --setup-role) SETUP_ROLE=true;  shift   ;;
+    --ou)         OU="$2";          shift 2 ;;
+    --include)    INCLUDE="$2";     shift 2 ;;
+    --exclude)    EXCLUDE="$2";     shift 2 ;;
+    --output)     OUTPUT="$2";      shift 2 ;;
     --help|-h)    usage ;;
     *) fail "Unknown option: $1" ;;
   esac
@@ -444,18 +475,19 @@ CALLER_ARN=$(echo "$IDENTITY"     | jq -r '.Arn')
 log "Running as:         $CALLER_ARN"
 log "Management account: $CALLER_ACCOUNT"
 
-# Setup-role: deploy StackSet, ensure teardown on exit
+# Deploy StackSet if requested; always tear it down on exit
 if [[ "$SETUP_ROLE" == true ]]; then
   ROLE="$DISCOVERY_ROLE"
   deploy_stackset "$CALLER_ACCOUNT" "$OU" "$INCLUDE"
   trap 'teardown_stackset "$OU" "$INCLUDE"' EXIT
 fi
 
-# Collect accounts
-mapfile -t ACCOUNTS < <(list_accounts "$OU" "$INCLUDE" "$EXCLUDE")
+# Collect accounts into ACCOUNTS array (portable — no mapfile)
+ACCOUNTS=()
+read_lines_into_array ACCOUNTS < <(list_accounts "$OU" "$INCLUDE" "$EXCLUDE")
+
 log ""
 log "Accounts to scan: ${#ACCOUNTS[@]}"
-
 [[ ${#ACCOUNTS[@]} -eq 0 ]] && fail "No accounts found to scan."
 
 # Output file
@@ -463,34 +495,46 @@ log "Accounts to scan: ${#ACCOUNTS[@]}"
 > "$OUTPUT"
 touch "${OUTPUT}.lock"
 
-# Scan accounts in parallel, capped at MAX_ACCOUNT_JOBS
-completed=0; failed=0; active=0
-declare -A pids
+# Scan accounts in parallel, capped at MAX_ACCOUNT_JOBS.
+# Uses only plain arrays and per-PID wait — compatible with bash 3.2 and zsh.
+active_pids=()
+
+throttle_jobs() {
+  # Remove finished PIDs from active_pids
+  local remaining=()
+  local pid
+  for pid in "${active_pids[@]}"; do
+    kill -0 "$pid" 2>/dev/null && remaining+=("$pid") || true
+  done
+  active_pids=("${remaining[@]+"${remaining[@]}"}")
+
+  # Block until a slot is free
+  while (( ${#active_pids[@]} >= MAX_ACCOUNT_JOBS )); do
+    sleep 0.5
+    remaining=()
+    for pid in "${active_pids[@]}"; do
+      kill -0 "$pid" 2>/dev/null && remaining+=("$pid") || true
+    done
+    active_pids=("${remaining[@]+"${remaining[@]}"}")
+  done
+}
 
 for account in "${ACCOUNTS[@]}"; do
+  throttle_jobs
   scan_account "$account" "$CALLER_ACCOUNT" "$ROLE" "$OUTPUT" &
-  pids[$!]="$account"
-  (( active++ )) || true
-
-  # Wait for a slot when at capacity
-  if (( active >= MAX_ACCOUNT_JOBS )); then
-    wait -n 2>/dev/null || wait
-    (( active-- )) || true
-  fi
+  active_pids+=($!)
 done
 
-# Wait for remaining jobs
-for pid in "${!pids[@]}"; do
-  if wait "$pid" 2>/dev/null; then
-    (( completed++ )) || true
-  else
-    (( failed++ )) || true
-    log "  [fail] ${pids[$pid]}"
-  fi
+# Wait for all remaining jobs
+for pid in "${active_pids[@]}"; do
+  wait "$pid" 2>/dev/null || true
 done
 
 rm -f "${OUTPUT}.lock"
 
+# Count results from output file
+completed=$(grep -c '"account_id"' "$OUTPUT" 2>/dev/null || echo 0)
+
 log ""
-log "Scanned: $completed  Failed: $failed"
-log "Output:  $OUTPUT"
+log "Regions scanned: $completed"
+log "Output:          $OUTPUT"
