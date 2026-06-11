@@ -14,7 +14,11 @@ export AWS_PAGER=""
 DEFAULT_ROLE="OrganizationAccountAccessRole"
 DISCOVERY_ROLE="DatafyDiscoveryRole"
 STACKSET_NAME="DatafyDiscovery"
-MAX_ACCOUNT_JOBS=20
+# Each aws CLI call is a Python process (~60MB RAM).
+# MAX_ACCOUNT_JOBS × MAX_REGION_JOBS × 5 = peak concurrent processes.
+# 4 × 4 × 5 = 80 processes (~5GB peak) — safe for most laptops.
+MAX_ACCOUNT_JOBS=4
+MAX_REGION_JOBS=4
 
 DISCOVERY_ROLE_TEMPLATE='{
   "AWSTemplateFormatVersion": "2010-09-09",
@@ -235,12 +239,30 @@ scan_account() {
     return 1
   }
 
-  # Scan each region in parallel, writing to a temp dir
+  # Scan regions in parallel, capped at MAX_REGION_JOBS
   local tmp_dir
   tmp_dir=$(make_tmpdir)
   local region_pids=()
 
+  throttle_region_jobs() {
+    local live=()
+    local p
+    for p in "${region_pids[@]+"${region_pids[@]}"}"; do
+      kill -0 "$p" 2>/dev/null && live+=("$p") || true
+    done
+    region_pids=("${live[@]+"${live[@]}"}")
+    while (( ${#region_pids[@]} >= MAX_REGION_JOBS )); do
+      sleep 0.3
+      live=()
+      for p in "${region_pids[@]+"${region_pids[@]}"}"; do
+        kill -0 "$p" 2>/dev/null && live+=("$p") || true
+      done
+      region_pids=("${live[@]+"${live[@]}"}")
+    done
+  }
+
   for region in $regions; do
+    throttle_region_jobs
     (
       [[ -n "$role_env" ]] && eval "$role_env"
       result=$(scan_region "$account_id" "$region") && \
@@ -249,9 +271,9 @@ scan_account() {
     region_pids+=($!)
   done
 
-  # Wait for all region jobs (compatible with bash 3.2 — no wait -n needed here)
+  # Wait for all remaining region jobs
   local pid
-  for pid in "${region_pids[@]}"; do
+  for pid in "${region_pids[@]+"${region_pids[@]}"}"; do
     wait "$pid" 2>/dev/null || true
   done
 
