@@ -453,11 +453,19 @@ CALLER_ARN=$(echo "$IDENTITY"     | jq -r '.Arn')
 log "Running as:         $CALLER_ARN"
 log "Management account: $CALLER_ACCOUNT"
 
-# Deploy StackSet if requested; always tear it down on exit
+# Single EXIT trap — handles both StackSet teardown and lock file cleanup
+TEARDOWN_STACKSET=false
+cleanup() {
+  rm -f "${OUTPUT}.lock"
+  [[ "$TEARDOWN_STACKSET" == true ]] && teardown_stackset "$OU" "$INCLUDE"
+}
+trap cleanup EXIT
+
+# Deploy StackSet if requested
 if [[ "$SETUP_ROLE" == true ]]; then
   ROLE="$DISCOVERY_ROLE"
   deploy_stackset "$CALLER_ACCOUNT" "$OU" "$INCLUDE"
-  trap 'teardown_stackset "$OU" "$INCLUDE"' EXIT
+  TEARDOWN_STACKSET=true
 fi
 
 # Collect accounts into ACCOUNTS array (portable — no mapfile)
@@ -472,7 +480,6 @@ log "Accounts to scan: ${#ACCOUNTS[@]}"
 [[ -z "$OUTPUT" ]] && OUTPUT="discovery_$(date -u +%Y%m%d_%H%M%S).json"
 > "$OUTPUT"
 touch "${OUTPUT}.lock"
-trap 'rm -f "${OUTPUT}.lock"' EXIT
 
 # Scan accounts in parallel, capped at MAX_ACCOUNT_JOBS.
 # Uses only plain arrays and per-PID wait — compatible with bash 3.2 and zsh.
