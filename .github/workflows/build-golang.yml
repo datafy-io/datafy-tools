@@ -1,0 +1,58 @@
+name: Build Go Binary
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "scoping-tool/golang/**"
+  pull_request:
+    paths:
+      - "scoping-tool/golang/**"
+
+jobs:
+  build:
+    name: Build (${{ matrix.goos }}/${{ matrix.goarch }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - goos: linux
+            goarch: amd64
+          - goos: linux
+            goarch: arm64
+          - goos: darwin
+            goarch: amd64
+          - goos: darwin
+            goarch: arm64
+          - goos: windows
+            goarch: amd64
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: scoping-tool/golang/go.mod
+          cache-dependency-path: scoping-tool/golang/go.sum
+
+      - name: Download modules
+        working-directory: scoping-tool/golang
+        run: go mod tidy
+
+      - name: Build
+        working-directory: scoping-tool/golang
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: "0"
+        run: |
+          BIN=discovery-${{ matrix.goos }}-${{ matrix.goarch }}
+          [ "${{ matrix.goos }}" = "windows" ] && BIN="${BIN}.exe"
+          go build -ldflags="-s -w" -o "${BIN}" .
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: discovery-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: scoping-tool/golang/discovery-*
+          if-no-files-found: error
