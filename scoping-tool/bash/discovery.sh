@@ -126,7 +126,7 @@ scan_region() {
   volumes=$(aws ec2 describe-volumes \
     --region "$region" --output json \
     --query 'Volumes' 2>/dev/null || echo "[]")
-  volumes=$(echo "$volumes" | jq '[.[] | {
+  volumes=$(echo "${volumes:-[]}" | jq '[.[]? | {
     VolumeId,
     Name: (.Tags // [] | map(select(.Key=="Name")) | first | .Value),
     Size,
@@ -147,7 +147,7 @@ scan_region() {
   reservations=$(aws ec2 describe-instances \
     --region "$region" --output json \
     --query 'Reservations' 2>/dev/null || echo "[]")
-  instances=$(echo "$reservations" | jq '[.[] as $r | $r.Instances[] | {
+  instances=$(echo "${reservations:-[]}" | jq '[.[]? as $r | $r.Instances[]? | {
     InstanceId,
     Name: (.Tags // [] | map(select(.Key=="Name")) | first | .Value),
     InstanceType,
@@ -163,14 +163,14 @@ scan_region() {
   }]')
 
   # AMIs referenced by instances
-  ami_ids=$(echo "$reservations" | jq -r '[.[] | .Instances[] | .ImageId] | unique | @sh')
+  ami_ids=$(echo "${reservations:-[]}" | jq -r '[.[]? | .Instances[]? | .ImageId] | unique | @sh')
   local amis="[]"
   if [[ -n "$ami_ids" && "$ami_ids" != "''" ]]; then
     amis=$(eval "aws ec2 describe-images \
       --region \"$region\" --output json \
       --image-ids $ami_ids \
       --query 'Images'" 2>/dev/null || echo "[]")
-    amis=$(echo "$amis" | jq '[.[] | {
+    amis=$(echo "${amis:-[]}" | jq '[.[]? | {
       ImageId,
       Name,
       Description,
@@ -185,7 +185,7 @@ scan_region() {
     --region "$region" --output json \
     --owner-ids self \
     --query 'Snapshots' 2>/dev/null || echo "[]")
-  snapshots=$(echo "$snapshots" | jq '[.[] | {
+  snapshots=$(echo "${snapshots:-[]}" | jq '[.[]? | {
     SnapshotId,
     VolumeId,
     VolumeSize,
@@ -200,7 +200,7 @@ scan_region() {
   dlm_policies=$(aws dlm get-lifecycle-policies \
     --region "$region" --output json \
     --query 'Policies' 2>/dev/null || echo "[]")
-  dlm_policies=$(echo "$dlm_policies" | jq '[.[] | {
+  dlm_policies=$(echo "${dlm_policies:-[]}" | jq '[.[]? | {
     PolicyId,
     Description,
     State,
@@ -212,7 +212,7 @@ scan_region() {
   backup_plans=$(aws backup list-backup-plans \
     --region "$region" --output json \
     --query 'BackupPlansList' 2>/dev/null || echo "[]")
-  backup_plans=$(echo "$backup_plans" | jq '[.[] | {
+  backup_plans=$(echo "${backup_plans:-[]}" | jq '[.[]? | {
     BackupPlanId,
     BackupPlanName,
     CreationDate
