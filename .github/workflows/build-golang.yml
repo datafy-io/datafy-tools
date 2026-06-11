@@ -78,3 +78,32 @@ jobs:
         with:
           files: artifacts/discovery-*
           generate_release_notes: true
+          body: |
+            ## Datafy Discovery Tool ${{ github.ref_name }}
+
+            Inventories EBS volumes, EC2 instances, AMIs, snapshots, DLM policies, and AWS Backup plans across all accounts in an AWS Organization. Output is one JSON object per account × region (JSONL format).
+
+            ## Download
+
+            | Platform | Binary |
+            |----------|--------|
+            | Linux x86-64 | `discovery-linux-amd64` |
+            | Linux ARM64 | `discovery-linux-arm64` |
+            | macOS x86-64 | `discovery-darwin-amd64` |
+            | macOS Apple Silicon | `discovery-darwin-arm64` |
+            | Windows x86-64 | `discovery-windows-amd64.exe` |
+
+            ## Quick start
+
+            ```bash
+            # Scan all accounts in the org
+            ./discovery -profile myprofile
+
+            # Deploy a minimal read-only role via StackSet, scan, then auto-teardown
+            ./discovery -profile myprofile -setup-role
+
+            # Scan a specific OU
+            ./discovery -profile myprofile -ou ou-ab12-xxxxxxxx
+            ```
+
+            See the [README](https://github.com/datafy-io/datafy-tools/blob/main/scoping-tool/golang/README.md) for full usage.
