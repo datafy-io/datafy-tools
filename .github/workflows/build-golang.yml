@@ -4,12 +4,12 @@ on:
   push:
     branches: [main]
     paths:
-      - "scoping-tool/**"
+      - "discovery-tool/**"
     tags:
       - "v*"
   pull_request:
     paths:
-      - "scoping-tool/**"
+      - "discovery-tool/**"
 
 jobs:
   build:
@@ -35,15 +35,15 @@ jobs:
 
       - uses: actions/setup-go@v5
         with:
-          go-version-file: scoping-tool/golang/go.mod
-          cache-dependency-path: scoping-tool/golang/go.sum
+          go-version-file: discovery-tool/golang/go.mod
+          cache-dependency-path: discovery-tool/golang/go.sum
 
       - name: Download modules
-        working-directory: scoping-tool/golang
+        working-directory: discovery-tool/golang
         run: go mod tidy
 
       - name: Build
-        working-directory: scoping-tool/golang
+        working-directory: discovery-tool/golang
         env:
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
@@ -56,7 +56,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: discovery-${{ matrix.goos }}-${{ matrix.goarch }}
-          path: scoping-tool/golang/discovery-*
+          path: discovery-tool/golang/discovery-*
           if-no-files-found: error
 
   release:
@@ -77,8 +77,8 @@ jobs:
 
       - name: Stage release assets
         run: |
-          cp scoping-tool/bash/discovery.sh    artifacts/discovery.sh
-          cp scoping-tool/python/discovery.py  artifacts/discovery.py
+          cp discovery-tool/bash/discovery.sh    artifacts/discovery.sh
+          cp discovery-tool/python/discovery.py  artifacts/discovery.py
 
       - name: Create GitHub release
         uses: softprops/action-gh-release@v2
@@ -120,4 +120,4 @@ jobs:
             python3 discovery.py --profile myprofile --setup-role
             ```
 
-            See the [README](https://github.com/datafy-io/datafy-tools/blob/main/scoping-tool/README.md) for full usage.
+            See the [README](https://github.com/datafy-io/datafy-tools/blob/main/discovery-tool/README.md) for full usage.
