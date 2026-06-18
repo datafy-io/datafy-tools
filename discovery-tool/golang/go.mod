@@ -1,4 +1,4 @@
-module github.com/datafy-io/datafy-tools/scoping-tool
+module github.com/datafy-io/datafy-tools/discovery-tool
 
 go 1.26
 
