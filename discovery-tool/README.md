@@ -15,7 +15,7 @@ Inventories EBS volumes, EC2 instances, AMIs, snapshots, DLM policies, and AWS B
 | DLM Policies | Policy list |
 | AWS Backup Plans | Plan list |
 
-Output is one JSON object per account × region (JSONL format), identical across all three implementations.
+Output is one JSON object per account × region (JSONL format), identical across all three implementations, followed by a summary record. Accounts and regions that could not be scanned are recorded in the file with a reason — see [Output format](#output-format).
 
 ## Prerequisites
 
@@ -180,13 +180,20 @@ All three implementations share the same interface:
 
 ## Output format
 
-One JSON object per line, one per account × region:
+One JSON object per line. Every line carries a `record_type` — `region`, `account`, or `summary`.
+
+### Region records
+
+One per account × region:
 
 ```json
 {
+  "record_type": "region",
   "account_id": "123456789012",
   "region": "us-east-1",
+  "status": "ok",
   "scanned_at": "2026-06-10T14:30:00Z",
+  "errors": [],
   "volumes": [...],
   "instances": [...],
   "amis": [...],
@@ -196,7 +203,72 @@ One JSON object per line, one per account × region:
 }
 ```
 
-Concatenate output from multiple runs:
+`status` tells you whether the data is trustworthy — an empty region and an
+inaccessible one are no longer indistinguishable:
+
+| `status` | Meaning |
+|---|---|
+| `ok` | Every API call succeeded. Empty arrays mean the region really is empty. |
+| `partial` | Some calls were denied or failed. The data is incomplete; `errors` says which calls and why. |
+| `failed` | The region could not be read at all. All arrays are empty and `errors` explains why. |
+
+`errors` entries name the API and the reason, e.g.
+`"ec2:DescribeVolumes: AccessDenied: User is not authorized to perform..."`.
+
+### Account records
+
+Emitted only for accounts that were never scanned, so a missing account is
+always visible in the file itself:
+
+```json
+{
+  "record_type": "account",
+  "account_id": "234567890123",
+  "status": "skipped",
+  "reason": "cannot assume role OrganizationAccountAccessRole: AccessDenied: ...",
+  "scanned_at": "2026-06-10T14:30:00Z"
+}
+```
+
+`skipped` means the role could not be assumed; `failed` means the role was
+assumed but the scan could not start (for example `ec2:DescribeRegions` was
+denied).
+
+### Summary record
+
+Always the **last** line, so a truncated upload is obvious and coverage is
+answerable from the shared file alone:
+
+```json
+{
+  "record_type": "summary",
+  "tool_version": "0.2.0",
+  "scanned_at": "2026-06-10T14:35:00Z",
+  "accounts_total": 900,
+  "accounts_scanned": 880,
+  "accounts_skipped": 15,
+  "accounts_failed": 5,
+  "regions_scanned": 15840,
+  "regions_partial": 12,
+  "regions_failed": 8
+}
+```
+
+### Checking coverage
+
+```bash
+# Did the run cover everything?
+tail -1 discovery_*.json | jq
+
+# Which accounts were never scanned, and why?
+jq -r 'select(.record_type == "account") | "\(.account_id)\t\(.status)\t\(.reason)"' discovery_*.json
+
+# Which regions came back incomplete?
+jq -r 'select(.record_type == "region" and .status != "ok")
+       | "\(.account_id)/\(.region)\t\(.status)\t\(.errors | join("; "))"' discovery_*.json
+```
+
+Concatenate output from multiple runs (each run keeps its own summary line):
 
 ```bash
 cat run1.json run2.json > combined.json

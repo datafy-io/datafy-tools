@@ -20,6 +20,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -40,7 +41,7 @@ import (
 // ── Constants ──────────────────────────────────────────────────────────────────
 
 const (
-	version           = "0.1.1"
+	version           = "0.2.0"
 	defaultRoleName   = "OrganizationAccountAccessRole"
 	discoveryRoleName = "DatafyDiscoveryRole"
 	stackSetName      = "DatafyDiscovery"
@@ -48,6 +49,10 @@ const (
 	sessionDuration   = time.Hour
 	maxAccountWorkers = 20
 	maxRegionWorkers  = 10
+	// DescribeImages rejects a request carrying every AMI id in a large region.
+	amiBatchSize = 100
+	// Keep error strings readable in the output file.
+	maxErrorChars = 400
 )
 
 // IAM role CloudFormation template deployed to each child account.
@@ -169,16 +174,84 @@ type BackupPlan struct {
 	CreationDate   string `json:"CreationDate"`
 }
 
+// RegionRecord carries the inventory for one account x region, plus whether we
+// actually managed to collect it. status is "ok" (every call succeeded),
+// "partial" (some calls were denied — the data is incomplete) or "failed" (the
+// region could not be read at all). Without this an empty region and a denied
+// region were indistinguishable in the output. (DT-11095)
 type RegionRecord struct {
+	RecordType  string       `json:"record_type"`
 	AccountId   string       `json:"account_id"`
 	Region      string       `json:"region"`
+	Status      string       `json:"status"`
 	ScannedAt   string       `json:"scanned_at"`
+	Errors      []string     `json:"errors"`
 	Volumes     []Volume     `json:"volumes"`
 	Instances   []Instance   `json:"instances"`
 	AMIs        []AMI        `json:"amis"`
 	Snapshots   []Snapshot   `json:"snapshots"`
 	DLMPolicies []DLMPolicy  `json:"dlm_policies"`
 	BackupPlans []BackupPlan `json:"backup_plans"`
+}
+
+// AccountRecord marks an account that was never scanned: "skipped" when the
+// role could not be assumed, "failed" when it was assumed but the scan could
+// not start. stderr is not part of what the customer sends us, so the reason
+// has to live in the file.
+type AccountRecord struct {
+	RecordType string `json:"record_type"`
+	AccountId  string `json:"account_id"`
+	Status     string `json:"status"`
+	Reason     string `json:"reason"`
+	ScannedAt  string `json:"scanned_at"`
+}
+
+// SummaryRecord is the final line of the output, so coverage is answerable from
+// the shared file alone and a truncated upload is obvious.
+type SummaryRecord struct {
+	RecordType      string `json:"record_type"`
+	ToolVersion     string `json:"tool_version"`
+	ScannedAt       string `json:"scanned_at"`
+	AccountsTotal   int    `json:"accounts_total"`
+	AccountsScanned int    `json:"accounts_scanned"`
+	AccountsSkipped int    `json:"accounts_skipped"`
+	AccountsFailed  int    `json:"accounts_failed"`
+	RegionsScanned  int    `json:"regions_scanned"`
+	RegionsPartial  int    `json:"regions_partial"`
+	RegionsFailed   int    `json:"regions_failed"`
+}
+
+func newAccountRecord(accountId, status, reason string) AccountRecord {
+	return AccountRecord{
+		RecordType: "account",
+		AccountId:  accountId,
+		Status:     status,
+		Reason:     reason,
+		ScannedAt:  time.Now().UTC().Format(time.RFC3339),
+	}
+}
+
+// condense squashes an error into one short line fit for a JSON field.
+func condense(err error) string {
+	s := strings.Join(strings.Fields(err.Error()), " ")
+	if len(s) > maxErrorChars {
+		s = s[:maxErrorChars]
+	}
+	return s
+}
+
+func dedupeSorted(in []string) []string {
+	out := make([]string, 0, len(in))
+	seen := map[string]struct{}{}
+	for _, s := range in {
+		if _, ok := seen[s]; ok {
+			continue
+		}
+		seen[s] = struct{}{}
+		out = append(out, s)
+	}
+	sort.Strings(out)
+	return out
 }
 
 // ── Concurrency helpers ────────────────────────────────────────────────────────
@@ -239,16 +312,28 @@ func configForAccount(ctx context.Context, base aws.Config, accountId, callerAcc
 
 // ── Per-region scan ────────────────────────────────────────────────────────────
 
-func scanRegion(ctx context.Context, cfg aws.Config, accountId, region string) (RegionRecord, error) {
+// scanRegion always returns a record. Each AWS call is attempted independently
+// and its failure recorded, so a region that was denied is reported as such
+// instead of silently disappearing from the output. (DT-11095)
+func scanRegion(ctx context.Context, cfg aws.Config, accountId, region string) RegionRecord {
 	ec2Client := ec2.NewFromConfig(cfg, func(o *ec2.Options) { o.Region = region })
 
+	var errs []string
+	calls, failures := 0, 0
+	fail := func(api string, err error) {
+		failures++
+		errs = append(errs, fmt.Sprintf("%s: %s", api, condense(err)))
+	}
+
 	// Volumes
-	var volumes []Volume
+	volumes := []Volume{}
+	calls++
 	volPager := ec2.NewDescribeVolumesPaginator(ec2Client, &ec2.DescribeVolumesInput{})
 	for volPager.HasMorePages() {
 		page, err := volPager.NextPage(ctx)
 		if err != nil {
-			return RegionRecord{}, fmt.Errorf("describe-volumes: %w", err)
+			fail("ec2:DescribeVolumes", err)
+			break
 		}
 		for _, v := range page.Volumes {
 			vol := Volume{
@@ -273,13 +358,15 @@ func scanRegion(ctx context.Context, cfg aws.Config, accountId, region string) (
 	}
 
 	// Instances
-	var instances []Instance
+	instances := []Instance{}
 	amiIds := map[string]struct{}{}
+	calls++
 	instPager := ec2.NewDescribeInstancesPaginator(ec2Client, &ec2.DescribeInstancesInput{})
 	for instPager.HasMorePages() {
 		page, err := instPager.NextPage(ctx)
 		if err != nil {
-			return RegionRecord{}, fmt.Errorf("describe-instances: %w", err)
+			fail("ec2:DescribeInstances", err)
+			break
 		}
 		for _, r := range page.Reservations {
 			ownerId := aws.ToString(r.OwnerId)
@@ -306,15 +393,31 @@ func scanRegion(ctx context.Context, cfg aws.Config, accountId, region string) (
 		}
 	}
 
-	// AMIs referenced by discovered instances
-	var amis []AMI
+	// AMIs referenced by discovered instances, looked up in batches — one call
+	// carrying every id in the region is rejected by the API.
+	amis := []AMI{}
 	if len(amiIds) > 0 {
+		calls++
 		ids := make([]string, 0, len(amiIds))
 		for id := range amiIds {
 			ids = append(ids, id)
 		}
-		resp, err := ec2Client.DescribeImages(ctx, &ec2.DescribeImagesInput{ImageIds: ids})
-		if err == nil {
+		sort.Strings(ids)
+
+		amiFailed := false
+		for start := 0; start < len(ids); start += amiBatchSize {
+			end := start + amiBatchSize
+			if end > len(ids) {
+				end = len(ids)
+			}
+			resp, err := ec2Client.DescribeImages(ctx, &ec2.DescribeImagesInput{ImageIds: ids[start:end]})
+			if err != nil {
+				if !amiFailed {
+					fail("ec2:DescribeImages", err)
+					amiFailed = true
+				}
+				continue
+			}
 			for _, a := range resp.Images {
 				amis = append(amis, AMI{
 					ImageId:      aws.ToString(a.ImageId),
@@ -328,13 +431,15 @@ func scanRegion(ctx context.Context, cfg aws.Config, accountId, region string) (
 	}
 
 	// Snapshots (owned by this account)
-	var snapshots []Snapshot
+	snapshots := []Snapshot{}
+	calls++
 	snapPager := ec2.NewDescribeSnapshotsPaginator(ec2Client, &ec2.DescribeSnapshotsInput{
 		OwnerIds: []string{"self"},
 	})
 	for snapPager.HasMorePages() {
 		page, err := snapPager.NextPage(ctx)
 		if err != nil {
+			fail("ec2:DescribeSnapshots", err)
 			break
 		}
 		for _, s := range page.Snapshots {
@@ -354,9 +459,12 @@ func scanRegion(ctx context.Context, cfg aws.Config, accountId, region string) (
 	}
 
 	// DLM policies
-	var dlmPolicies []DLMPolicy
+	dlmPolicies := []DLMPolicy{}
+	calls++
 	dlmClient := dlm.NewFromConfig(cfg, func(o *dlm.Options) { o.Region = region })
-	if dlmResp, err := dlmClient.GetLifecyclePolicies(ctx, &dlm.GetLifecyclePoliciesInput{}); err == nil {
+	if dlmResp, err := dlmClient.GetLifecyclePolicies(ctx, &dlm.GetLifecyclePoliciesInput{}); err != nil {
+		fail("dlm:GetLifecyclePolicies", err)
+	} else {
 		for _, p := range dlmResp.Policies {
 			dlmPolicies = append(dlmPolicies, DLMPolicy{
 				PolicyId:    aws.ToString(p.PolicyId),
@@ -368,12 +476,14 @@ func scanRegion(ctx context.Context, cfg aws.Config, accountId, region string) (
 	}
 
 	// AWS Backup plans
-	var backupPlans []BackupPlan
+	backupPlans := []BackupPlan{}
+	calls++
 	backupClient := backupsvc.NewFromConfig(cfg, func(o *backupsvc.Options) { o.Region = region })
 	bkPager := backupsvc.NewListBackupPlansPaginator(backupClient, &backupsvc.ListBackupPlansInput{})
 	for bkPager.HasMorePages() {
 		page, err := bkPager.NextPage(ctx)
 		if err != nil {
+			fail("backup:ListBackupPlans", err)
 			break
 		}
 		for _, b := range page.BackupPlansList {
@@ -388,31 +498,58 @@ func scanRegion(ctx context.Context, cfg aws.Config, accountId, region string) (
 		}
 	}
 
+	status := "ok"
+	if failures > 0 {
+		if failures >= calls {
+			status = "failed"
+		} else {
+			status = "partial"
+		}
+	}
+
 	return RegionRecord{
+		RecordType:  "region",
 		AccountId:   accountId,
 		Region:      region,
+		Status:      status,
 		ScannedAt:   time.Now().UTC().Format(time.RFC3339),
+		Errors:      dedupeSorted(errs),
 		Volumes:     volumes,
 		Instances:   instances,
 		AMIs:        amis,
 		Snapshots:   snapshots,
 		DLMPolicies: dlmPolicies,
 		BackupPlans: backupPlans,
-	}, nil
+	}
 }
 
 // ── Per-account scan ───────────────────────────────────────────────────────────
 
-func scanAccount(ctx context.Context, base aws.Config, accountId, callerAccountId, roleName string) ([]RegionRecord, error) {
+// scanAccount returns the region records for an account, or a single
+// AccountRecord explaining why it could not be scanned. Exactly one of the two
+// is non-empty — an unreachable account is never dropped from the output.
+func scanAccount(ctx context.Context, base aws.Config, accountId, callerAccountId, roleName string) ([]RegionRecord, *AccountRecord) {
 	cfg, err := configForAccount(ctx, base, accountId, callerAccountId, roleName)
 	if err != nil {
-		return nil, fmt.Errorf("cannot assume role: %w", err)
+		reason := fmt.Sprintf("cannot assume role %s: %s", roleName, condense(err))
+		fmt.Fprintf(os.Stderr, "  [skip] %s: %s\n", accountId, reason)
+		rec := newAccountRecord(accountId, "skipped", reason)
+		return nil, &rec
 	}
 
 	ec2Client := ec2.NewFromConfig(cfg, func(o *ec2.Options) { o.Region = "us-east-1" })
 	regResp, err := ec2Client.DescribeRegions(ctx, &ec2.DescribeRegionsInput{})
 	if err != nil {
-		return nil, fmt.Errorf("describe-regions: %w", err)
+		reason := fmt.Sprintf("cannot list regions: %s", condense(err))
+		fmt.Fprintf(os.Stderr, "  [fail] %s: %s\n", accountId, reason)
+		rec := newAccountRecord(accountId, "failed", reason)
+		return nil, &rec
+	}
+	if len(regResp.Regions) == 0 {
+		reason := "ec2:DescribeRegions returned no enabled regions"
+		fmt.Fprintf(os.Stderr, "  [fail] %s: %s\n", accountId, reason)
+		rec := newAccountRecord(accountId, "failed", reason)
+		return nil, &rec
 	}
 
 	var (
@@ -429,17 +566,31 @@ func scanAccount(ctx context.Context, base aws.Config, accountId, callerAccountI
 			defer wg.Done()
 			sem.acquire()
 			defer sem.release()
-			rec, err := scanRegion(ctx, cfg, accountId, region)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "  [warn] %s/%s: %v\n", accountId, region, err)
-				return
-			}
+			rec := scanRegion(ctx, cfg, accountId, region)
 			mu.Lock()
 			records = append(records, rec)
 			mu.Unlock()
 		}(region)
 	}
 	wg.Wait()
+
+	// Name the regions, not just a count — this is the only signal the operator
+	// sees while the scan is running.
+	var failed, partial []string
+	for _, r := range records {
+		switch r.Status {
+		case "failed":
+			failed = append(failed, r.Region)
+		case "partial":
+			partial = append(partial, r.Region)
+		}
+	}
+	if len(partial) > 0 {
+		fmt.Fprintf(os.Stderr, "         %s partial: %s\n", accountId, strings.Join(dedupeSorted(partial), " "))
+	}
+	if len(failed) > 0 {
+		fmt.Fprintf(os.Stderr, "         %s failed:  %s\n", accountId, strings.Join(dedupeSorted(failed), " "))
+	}
 	return records, nil
 }
 
@@ -631,14 +782,14 @@ func teardownStackSet(ctx context.Context, cfg aws.Config, ou string, include []
 // ── Entry point ────────────────────────────────────────────────────────────────
 
 func main() {
-	versionFlag   := flag.Bool("version",     false,           "Show version")
-	profileFlag   := flag.String("profile",    "",              "AWS named profile (~/.aws/config)")
-	roleFlag      := flag.String("role",       defaultRoleName, "IAM role to assume in child accounts")
-	setupRoleFlag := flag.Bool("setup-role",   false,           "Deploy read-only role via StackSet; auto-removed after scan")
-	ouFlag        := flag.String("ou",         "",              "Limit to this Organizational Unit")
-	includeFlag   := flag.String("include",    "",              "Comma-separated account IDs to scan")
-	excludeFlag   := flag.String("exclude",    "",              "Comma-separated account IDs to skip")
-	outputFlag    := flag.String("output",     "",              "Output file (default: discovery_<timestamp>.json)")
+	versionFlag := flag.Bool("version", false, "Show version")
+	profileFlag := flag.String("profile", "", "AWS named profile (~/.aws/config)")
+	roleFlag := flag.String("role", defaultRoleName, "IAM role to assume in child accounts")
+	setupRoleFlag := flag.Bool("setup-role", false, "Deploy read-only role via StackSet; auto-removed after scan")
+	ouFlag := flag.String("ou", "", "Limit to this Organizational Unit")
+	includeFlag := flag.String("include", "", "Comma-separated account IDs to scan")
+	excludeFlag := flag.String("exclude", "", "Comma-separated account IDs to skip")
+	outputFlag := flag.String("output", "", "Output file (default: discovery_<timestamp>.json)")
 	flag.Parse()
 
 	if *versionFlag {
@@ -709,12 +860,15 @@ func main() {
 
 	enc := json.NewEncoder(f)
 	var (
-		mu        sync.Mutex
-		wg        sync.WaitGroup
-		sem       = make(semaphore, maxAccountWorkers)
-		completed int
-		skipped   int
-		failed    int
+		mu              sync.Mutex
+		wg              sync.WaitGroup
+		sem             = make(semaphore, maxAccountWorkers)
+		done            int
+		accountsSkipped int
+		accountsFailed  int
+		regionsScanned  int
+		regionsPartial  int
+		regionsFailed   int
 	)
 
 	for _, acct := range accounts {
@@ -724,28 +878,59 @@ func main() {
 			sem.acquire()
 			defer sem.release()
 
-			records, err := scanAccount(ctx, baseCfg, acct, callerAccountId, roleName)
+			records, acctRec := scanAccount(ctx, baseCfg, acct, callerAccountId, roleName)
 
 			mu.Lock()
 			defer mu.Unlock()
-			if err != nil {
-				failed++
-				fmt.Fprintf(os.Stderr, "  [fail] %s: %v\n", acct, err)
+			done++
+
+			if acctRec != nil {
+				_ = enc.Encode(acctRec)
+				if acctRec.Status == "skipped" {
+					accountsSkipped++
+				} else {
+					accountsFailed++
+				}
 				return
 			}
-			if len(records) == 0 {
-				skipped++
-				return
-			}
+
 			for _, r := range records {
 				_ = enc.Encode(r)
+				switch r.Status {
+				case "ok":
+					regionsScanned++
+				case "partial":
+					regionsPartial++
+				default:
+					regionsFailed++
+				}
 			}
-			completed++
-			fmt.Printf("  [%d/%d] %s — %d regions\n", completed+skipped+failed, len(accounts), acct, len(records))
+			fmt.Printf("  [%d/%d] %s — %d regions\n", done, len(accounts), acct, len(records))
 		}(acct)
 	}
 	wg.Wait()
 
-	fmt.Printf("\nScanned: %d  Skipped: %d  Failed: %d\n", completed, skipped, failed)
-	fmt.Printf("Output:  %s\n", outputFile)
+	summary := SummaryRecord{
+		RecordType:      "summary",
+		ToolVersion:     version,
+		ScannedAt:       time.Now().UTC().Format(time.RFC3339),
+		AccountsTotal:   len(accounts),
+		AccountsScanned: len(accounts) - accountsSkipped - accountsFailed,
+		AccountsSkipped: accountsSkipped,
+		AccountsFailed:  accountsFailed,
+		RegionsScanned:  regionsScanned,
+		RegionsPartial:  regionsPartial,
+		RegionsFailed:   regionsFailed,
+	}
+	_ = enc.Encode(summary)
+
+	fmt.Printf("\nAccounts: %d total, %d scanned, %d skipped, %d failed\n",
+		summary.AccountsTotal, summary.AccountsScanned, summary.AccountsSkipped, summary.AccountsFailed)
+	fmt.Printf("Regions:  %d scanned, %d partial, %d failed\n",
+		summary.RegionsScanned, summary.RegionsPartial, summary.RegionsFailed)
+	fmt.Printf("Output:   %s\n", outputFile)
+	if accountsSkipped+accountsFailed+regionsPartial+regionsFailed > 0 {
+		fmt.Printf("\nSome accounts or regions were not fully scanned. Every one is recorded in\n")
+		fmt.Printf("%s with a status and a reason — send the file as-is.\n", outputFile)
+	}
 }

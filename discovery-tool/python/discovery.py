@@ -32,7 +32,7 @@ import boto3
 from botocore.exceptions import ClientError, NoCredentialsError, PartialCredentialsError
 
 # ── Configuration ──────────────────────────────────────────────────────────────
-VERSION             = "0.1.1"
+VERSION             = "0.2.0"
 DEFAULT_ROLE_NAME   = "OrganizationAccountAccessRole"
 DISCOVERY_ROLE_NAME = "DatafyDiscoveryRole"
 STACKSET_NAME       = "DatafyDiscovery"
@@ -40,6 +40,8 @@ SESSION_NAME        = "DatafyDiscovery"
 SESSION_DURATION    = 3600   # seconds — 1 hour
 MAX_ACCOUNT_WORKERS = 20     # accounts scanned in parallel
 MAX_REGION_WORKERS  = 10     # regions scanned in parallel per account
+AMI_BATCH_SIZE      = 100    # DescribeImages rejects unbounded ImageIds lists
+MAX_ERROR_CHARS     = 400    # keep error strings readable in the output file
 
 # ── IAM role template deployed to each child account ──────────────────────────
 # Grants only the describe/list permissions this script actually calls.
@@ -123,38 +125,91 @@ def paginate(client, method, key, **kwargs):
     return results
 
 
+def now_utc():
+    return datetime.now(timezone.utc).isoformat()
+
+
+def condense(exc):
+    """Squash an exception into one short line fit for a JSON field."""
+    if isinstance(exc, ClientError):
+        err = exc.response.get("Error", {})
+        text = f"{err.get('Code', 'Error')}: {err.get('Message', str(exc))}"
+    else:
+        text = f"{type(exc).__name__}: {exc}"
+    return " ".join(text.split())[:MAX_ERROR_CHARS]
+
+
+def chunked(items, size):
+    for i in range(0, len(items), size):
+        yield items[i:i + size]
+
+
+def account_record(account_id, status, reason):
+    """
+    An account that was never scanned. Without this the account leaves no trace
+    in the file the customer sends us — only in stdout, which is not part of
+    what gets shared. (DT-11095)
+    """
+    return {
+        "record_type": "account",
+        "account_id":  account_id,
+        "status":      status,
+        "reason":      reason,
+        "scanned_at":  now_utc(),
+    }
+
+
 def session_for_account(account_id, role_name, caller_account_id):
     """
     Return a boto3 Session scoped to account_id by assuming role_name.
-    Returns None if role assumption fails (account is skipped).
+    Raises on failure so the caller can record why the account was skipped.
     """
     if account_id == caller_account_id:
         return boto3.Session(profile_name=boto3.DEFAULT_SESSION.profile_name)
-    try:
-        sts = boto3.client("sts")
-        creds = sts.assume_role(
-            RoleArn=f"arn:aws:iam::{account_id}:role/{role_name}",
-            RoleSessionName=SESSION_NAME,
-            DurationSeconds=SESSION_DURATION,
-        )["Credentials"]
-        return boto3.Session(
-            aws_access_key_id=creds["AccessKeyId"],
-            aws_secret_access_key=creds["SecretAccessKey"],
-            aws_session_token=creds["SessionToken"],
-        )
-    except ClientError as e:
-        log(f"  [skip] {account_id}: cannot assume role — {e.response['Error']['Message']}")
-        return None
+    sts = boto3.client("sts")
+    creds = sts.assume_role(
+        RoleArn=f"arn:aws:iam::{account_id}:role/{role_name}",
+        RoleSessionName=SESSION_NAME,
+        DurationSeconds=SESSION_DURATION,
+    )["Credentials"]
+    return boto3.Session(
+        aws_access_key_id=creds["AccessKeyId"],
+        aws_secret_access_key=creds["SecretAccessKey"],
+        aws_session_token=creds["SessionToken"],
+    )
 
 
 # ── Per-region scan ────────────────────────────────────────────────────────────
 
 def scan_region(session, account_id, region):
-    """Collect all discovery data for one account + region. Returns a dict."""
+    """
+    Collect all discovery data for one account + region. Always returns a dict.
+
+    Each AWS call is attempted independently and its failure recorded, so the
+    record can distinguish a region that is genuinely empty from one that was
+    denied or unreachable. Previously any failure raised out of this function
+    and the region silently disappeared from the output. (DT-11095)
+    """
+    errors = []
+    stats  = {"calls": 0, "failures": 0}
+
+    def attempt(api, fn, default):
+        stats["calls"] += 1
+        try:
+            return fn()
+        except Exception as e:                       # noqa: BLE001 — any failure must be reported
+            stats["failures"] += 1
+            errors.append(f"{api}: {condense(e)}")
+            return default
+
     ec2 = session.client("ec2", region_name=region)
 
     # EBS Volumes
-    raw_volumes = paginate(ec2, "describe_volumes", "Volumes")
+    raw_volumes = attempt(
+        "ec2:DescribeVolumes",
+        lambda: paginate(ec2, "describe_volumes", "Volumes"),
+        [],
+    )
     volumes = [{
         "VolumeId":         v["VolumeId"],
         "Name":             next((t["Value"] for t in v.get("Tags", []) if t["Key"] == "Name"), None),
@@ -172,7 +227,11 @@ def scan_region(session, account_id, region):
     } for v in raw_volumes]
 
     # EC2 Instances
-    reservations = paginate(ec2, "describe_instances", "Reservations")
+    reservations = attempt(
+        "ec2:DescribeInstances",
+        lambda: paginate(ec2, "describe_instances", "Reservations"),
+        [],
+    )
     instances = []
     ami_ids = set()
     for r in reservations:
@@ -193,20 +252,31 @@ def scan_region(session, account_id, region):
                 "Tags":             i.get("Tags", []),
             })
 
-    # AMIs referenced by the instances above
+    # AMIs referenced by the instances above. Looked up in batches: DescribeImages
+    # rejects a request carrying every AMI id in a large region.
     amis = []
     if ami_ids:
-        resp = ec2.describe_images(ImageIds=list(ami_ids))
+        def fetch_amis():
+            found = []
+            for batch in chunked(sorted(ami_ids), AMI_BATCH_SIZE):
+                resp = ec2.describe_images(ImageIds=batch)
+                found.extend(resp.get("Images", []))
+            return found
+
         amis = [{
             "ImageId":      a["ImageId"],
             "Name":         a.get("Name"),
             "Description":  a.get("Description"),
             "Platform":     a.get("Platform"),
             "Architecture": a.get("Architecture"),
-        } for a in resp.get("Images", [])]
+        } for a in attempt("ec2:DescribeImages", fetch_amis, [])]
 
     # Snapshots owned by this account
-    raw_snapshots = paginate(ec2, "describe_snapshots", "Snapshots", OwnerIds=["self"])
+    raw_snapshots = attempt(
+        "ec2:DescribeSnapshots",
+        lambda: paginate(ec2, "describe_snapshots", "Snapshots", OwnerIds=["self"]),
+        [],
+    )
     snapshots = [{
         "SnapshotId": s["SnapshotId"],
         "VolumeId":   s.get("VolumeId"),
@@ -217,29 +287,41 @@ def scan_region(session, account_id, region):
         "Tags":       s.get("Tags", []),
     } for s in raw_snapshots]
 
-    # DLM lifecycle policies (nice to have — ignore if region doesn't support it)
+    # DLM lifecycle policies
     dlm = session.client("dlm", region_name=region)
-    try:
-        dlm_policies = dlm.get_lifecycle_policies().get("Policies", [])
-    except ClientError:
-        dlm_policies = []
+    dlm_policies = attempt(
+        "dlm:GetLifecyclePolicies",
+        lambda: dlm.get_lifecycle_policies().get("Policies", []),
+        [],
+    )
 
-    # AWS Backup plans (nice to have — ignore if region doesn't support it)
+    # AWS Backup plans
     backup_client = session.client("backup", region_name=region)
-    try:
-        raw_plans = paginate(backup_client, "list_backup_plans", "BackupPlansList")
-        backup_plans = [{
-            "BackupPlanId":   b["BackupPlanId"],
-            "BackupPlanName": b["BackupPlanName"],
-            "CreationDate":   b["CreationDate"].isoformat(),
-        } for b in raw_plans]
-    except ClientError:
-        backup_plans = []
+    raw_plans = attempt(
+        "backup:ListBackupPlans",
+        lambda: paginate(backup_client, "list_backup_plans", "BackupPlansList"),
+        [],
+    )
+    backup_plans = [{
+        "BackupPlanId":   b["BackupPlanId"],
+        "BackupPlanName": b["BackupPlanName"],
+        "CreationDate":   b["CreationDate"].isoformat(),
+    } for b in raw_plans]
+
+    if stats["failures"] == 0:
+        status = "ok"
+    elif stats["failures"] >= stats["calls"]:
+        status = "failed"
+    else:
+        status = "partial"
 
     return {
+        "record_type":  "region",
         "account_id":   account_id,
         "region":       region,
-        "scanned_at":   datetime.now(timezone.utc).isoformat(),
+        "status":       status,
+        "scanned_at":   now_utc(),
+        "errors":       sorted(set(errors)),
         "volumes":      volumes,
         "instances":    instances,
         "amis":         amis,
@@ -252,13 +334,32 @@ def scan_region(session, account_id, region):
 # ── Per-account scan ───────────────────────────────────────────────────────────
 
 def scan_account(account_id, role_name, caller_account_id):
-    """Assume role in account_id, then scan all its regions in parallel."""
-    session = session_for_account(account_id, role_name, caller_account_id)
-    if session is None:
-        return []
+    """
+    Assume role in account_id, then scan all its regions in parallel.
 
-    ec2 = session.client("ec2", region_name="us-east-1")
-    regions = [r["RegionName"] for r in ec2.describe_regions()["Regions"]]
+    Always returns a non-empty list of records. An account or region that could
+    not be scanned is represented by a record explaining why, rather than being
+    dropped from the output. (DT-11095)
+    """
+    try:
+        session = session_for_account(account_id, role_name, caller_account_id)
+    except Exception as e:                           # noqa: BLE001
+        reason = f"cannot assume role {role_name}: {condense(e)}"
+        log(f"  [skip] {account_id}: {reason}")
+        return [account_record(account_id, "skipped", reason)]
+
+    try:
+        ec2 = session.client("ec2", region_name="us-east-1")
+        regions = [r["RegionName"] for r in ec2.describe_regions()["Regions"]]
+    except Exception as e:                           # noqa: BLE001
+        reason = f"cannot list regions: {condense(e)}"
+        log(f"  [fail] {account_id}: {reason}")
+        return [account_record(account_id, "failed", reason)]
+
+    if not regions:
+        reason = "ec2:DescribeRegions returned no enabled regions"
+        log(f"  [fail] {account_id}: {reason}")
+        return [account_record(account_id, "failed", reason)]
 
     records = []
     with ThreadPoolExecutor(max_workers=MAX_REGION_WORKERS) as pool:
@@ -267,8 +368,29 @@ def scan_account(account_id, role_name, caller_account_id):
             region = futures[future]
             try:
                 records.append(future.result())
-            except Exception as e:
+            except Exception as e:                   # noqa: BLE001
                 log(f"  [warn] {account_id}/{region}: {e}")
+                records.append({
+                    "record_type":  "region",
+                    "account_id":   account_id,
+                    "region":       region,
+                    "status":       "failed",
+                    "scanned_at":   now_utc(),
+                    "errors":       [f"region scan failed unexpectedly: {condense(e)}"],
+                    "volumes":      [],
+                    "instances":    [],
+                    "amis":         [],
+                    "snapshots":    [],
+                    "dlm_policies": [],
+                    "backup_plans": [],
+                })
+
+    failed  = [r["region"] for r in records if r["status"] == "failed"]
+    partial = [r["region"] for r in records if r["status"] == "partial"]
+    if partial:
+        log(f"         {account_id} partial: {' '.join(sorted(partial))}")
+    if failed:
+        log(f"         {account_id} failed:  {' '.join(sorted(failed))}")
     return records
 
 
@@ -455,9 +577,14 @@ def main():
         log(f"\nAccounts to scan: {len(accounts)}")
 
         output_file = args.output or f"discovery_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
-        completed = 0
-        skipped   = 0
-        failed    = 0
+        tally = {
+            "accounts_skipped": 0,
+            "accounts_failed":  0,
+            "regions_scanned":  0,
+            "regions_partial":  0,
+            "regions_failed":   0,
+        }
+        done = 0
 
         with open(output_file, "w") as out:
             with ThreadPoolExecutor(max_workers=MAX_ACCOUNT_WORKERS) as pool:
@@ -469,20 +596,51 @@ def main():
                     acct = futures[future]
                     try:
                         records = future.result()
-                        if not records:
-                            skipped += 1
-                        else:
-                            for record in records:
-                                out.write(json.dumps(record) + "\n")
-                            completed += 1
-                            total_done = completed + skipped + failed
-                            log(f"  [{total_done}/{len(accounts)}] {acct} — {len(records)} regions")
-                    except Exception as e:
-                        failed += 1
-                        log(f"  [fail] {acct}: {e}")
+                    except Exception as e:           # noqa: BLE001
+                        reason = f"account scan failed unexpectedly: {condense(e)}"
+                        log(f"  [fail] {acct}: {reason}")
+                        records = [account_record(acct, "failed", reason)]
 
-        log(f"\nScanned: {completed}  Skipped (no role): {skipped}  Failed: {failed}")
-        log(f"Output:  {output_file}")
+                    for record in records:
+                        out.write(json.dumps(record) + "\n")
+                        if record["record_type"] == "account":
+                            tally[f"accounts_{record['status']}"] += 1
+                        elif record["status"] == "ok":
+                            tally["regions_scanned"] += 1
+                        elif record["status"] == "partial":
+                            tally["regions_partial"] += 1
+                        else:
+                            tally["regions_failed"] += 1
+
+                    done += 1
+                    if records and records[0]["record_type"] == "region":
+                        log(f"  [{done}/{len(accounts)}] {acct} — {len(records)} regions")
+
+            # Last line of the file, so a truncated upload is obvious and coverage
+            # is answerable from the shared file alone. (DT-11095)
+            summary = {
+                "record_type":      "summary",
+                "tool_version":     VERSION,
+                "scanned_at":       now_utc(),
+                "accounts_total":   len(accounts),
+                "accounts_scanned": len(accounts) - tally["accounts_skipped"] - tally["accounts_failed"],
+                "accounts_skipped": tally["accounts_skipped"],
+                "accounts_failed":  tally["accounts_failed"],
+                "regions_scanned":  tally["regions_scanned"],
+                "regions_partial":  tally["regions_partial"],
+                "regions_failed":   tally["regions_failed"],
+            }
+            out.write(json.dumps(summary) + "\n")
+
+        log(f"\nAccounts: {summary['accounts_total']} total, {summary['accounts_scanned']} scanned, "
+            f"{summary['accounts_skipped']} skipped, {summary['accounts_failed']} failed")
+        log(f"Regions:  {summary['regions_scanned']} scanned, {summary['regions_partial']} partial, "
+            f"{summary['regions_failed']} failed")
+        log(f"Output:   {output_file}")
+        if any(summary[k] for k in ("accounts_skipped", "accounts_failed",
+                                    "regions_partial", "regions_failed")):
+            log("\nSome accounts or regions were not fully scanned. Every one is recorded in")
+            log(f"{output_file} with a status and a reason — send the file as-is.")
 
     finally:
         if args.setup_role:

@@ -56,6 +56,25 @@ chmod +x discovery.sh
 --output     FILE   Output file (default: discovery_<timestamp>.json)
 ```
 
+## Tests
+
+The bash implementation has a test suite that runs `discovery.sh` end to end
+against a mock AWS CLI — no AWS account or credentials needed:
+
+```bash
+./test/run_tests.sh          # all cases
+./test/run_tests.sh 01 04    # only cases matching these patterns
+```
+
+`test/lib/mock_aws.sh` is installed on `PATH` as `aws` and is driven entirely by
+`MOCK_*` environment variables (account list, region list, resource counts, and
+which calls should be denied), so a case can describe the org it needs — from a
+two-account smoke test to a region holding 4000 volumes.
+
+Cases live in `test/cases/`. `01`, `02` and `03` are stress tests that reproduce
+the `Argument list too long` failures and the resulting silent data loss;
+`04`, `05` and `06` cover the skipped/failed reporting.
+
 ## macOS note
 
 macOS ships with bash 3.2, which does not support `mapfile` or associative arrays. Install a modern bash:
