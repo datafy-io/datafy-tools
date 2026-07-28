@@ -161,6 +161,25 @@ chmod +x discovery.sh
 ./discovery.sh --profile myprofile
 ```
 
+## Tests
+
+Two suites, neither of which needs an AWS account:
+
+```bash
+./bash/test/run_tests.sh        # bash implementation, end to end against a mock CLI
+./test/parity/run_parity.sh     # all three implementations, compared
+```
+
+The parity harness starts a fake AWS endpoint and points all three tools at it
+via `AWS_ENDPOINT_URL`, so the real AWS CLI, real boto3 and the real Go SDK each
+run against the same responses. It then diffs their output and checks that
+skipped accounts, degraded regions and error codes are reported identically —
+which is what keeps the three implementations from drifting apart.
+
+Requires `jq` for both, plus `aws-cli v2`, `python3` with `boto3`, and `go` for
+the parity run. Any implementation whose toolchain is missing is reported as
+skipped rather than silently passing.
+
 ## All flags
 
 All three implementations share the same interface:
@@ -244,6 +263,7 @@ answerable from the shared file alone:
   "record_type": "summary",
   "tool_version": "0.2.0",
   "scanned_at": "2026-06-10T14:35:00Z",
+  "interrupted": false,
   "accounts_total": 900,
   "accounts_scanned": 880,
   "accounts_skipped": 15,
@@ -253,6 +273,12 @@ answerable from the shared file alone:
   "regions_failed": 8
 }
 ```
+
+`interrupted` is `true` when the run was stopped by Ctrl+C, a timeout or a
+supervisor. The tool writes out everything it had already collected, so a
+partial file is still useful — just don't read it as full coverage.
+
+All timestamps are RFC3339 UTC with a `Z` suffix, in every implementation.
 
 ### Checking coverage
 

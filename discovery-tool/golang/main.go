@@ -20,9 +20,12 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"os/signal"
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -212,6 +215,7 @@ type SummaryRecord struct {
 	RecordType      string `json:"record_type"`
 	ToolVersion     string `json:"tool_version"`
 	ScannedAt       string `json:"scanned_at"`
+	Interrupted     bool   `json:"interrupted"`
 	AccountsTotal   int    `json:"accounts_total"`
 	AccountsScanned int    `json:"accounts_scanned"`
 	AccountsSkipped int    `json:"accounts_skipped"`
@@ -810,7 +814,21 @@ func main() {
 		}
 	}
 
-	ctx := context.Background()
+	ctx, cancelScan := context.WithCancel(context.Background())
+	defer cancelScan()
+
+	// A large org can easily be Ctrl+C'd or killed by a timeout. Cancel the
+	// scan but still fall through to writing the summary, so everything already
+	// encoded to the file stays usable. (DT-11095)
+	var interrupted int32
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+	go func() {
+		sig := <-sigCh
+		atomic.StoreInt32(&interrupted, 1)
+		fmt.Fprintf(os.Stderr, "\nInterrupted (%v) — stopping scans and writing partial results...\n", sig)
+		cancelScan()
+	}()
 
 	baseCfg, err := loadBaseConfig(ctx, *profileFlag)
 	if err != nil {
@@ -914,6 +932,7 @@ func main() {
 		RecordType:      "summary",
 		ToolVersion:     version,
 		ScannedAt:       time.Now().UTC().Format(time.RFC3339),
+		Interrupted:     atomic.LoadInt32(&interrupted) == 1,
 		AccountsTotal:   len(accounts),
 		AccountsScanned: len(accounts) - accountsSkipped - accountsFailed,
 		AccountsSkipped: accountsSkipped,
@@ -929,6 +948,11 @@ func main() {
 	fmt.Printf("Regions:  %d scanned, %d partial, %d failed\n",
 		summary.RegionsScanned, summary.RegionsPartial, summary.RegionsFailed)
 	fmt.Printf("Output:   %s\n", outputFile)
+	if summary.Interrupted {
+		fmt.Printf("\nRun was interrupted — the results above are partial.\n")
+		_ = f.Close()
+		os.Exit(143)
+	}
 	if accountsSkipped+accountsFailed+regionsPartial+regionsFailed > 0 {
 		fmt.Printf("\nSome accounts or regions were not fully scanned. Every one is recorded in\n")
 		fmt.Printf("%s with a status and a reason — send the file as-is.\n", outputFile)

@@ -23,6 +23,7 @@ Usage:
 
 import argparse
 import json
+import signal
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -126,7 +127,16 @@ def paginate(client, method, key, **kwargs):
 
 
 def now_utc():
-    return datetime.now(timezone.utc).isoformat()
+    return iso_z(datetime.now(timezone.utc))
+
+
+def iso_z(dt):
+    """RFC3339 in UTC with a Z suffix.
+
+    isoformat() renders "+00:00", which the Go SDK does not — the parity
+    harness catches the mismatch. Z is what the README documents.
+    """
+    return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def condense(exc):
@@ -267,7 +277,7 @@ def scan_region(session, account_id, region):
             "ImageId":      a["ImageId"],
             "Name":         a.get("Name"),
             "Description":  a.get("Description"),
-            "Platform":     a.get("Platform"),
+            "Platform":     a.get("Platform") or "",
             "Architecture": a.get("Architecture"),
         } for a in attempt("ec2:DescribeImages", fetch_amis, [])]
 
@@ -281,7 +291,7 @@ def scan_region(session, account_id, region):
         "SnapshotId": s["SnapshotId"],
         "VolumeId":   s.get("VolumeId"),
         "VolumeSize": s.get("VolumeSize"),
-        "StartTime":  s["StartTime"].isoformat(),
+        "StartTime":  iso_z(s["StartTime"]),
         "State":      s["State"],
         "Encrypted":  s["Encrypted"],
         "Tags":       s.get("Tags", []),
@@ -305,7 +315,7 @@ def scan_region(session, account_id, region):
     backup_plans = [{
         "BackupPlanId":   b["BackupPlanId"],
         "BackupPlanName": b["BackupPlanName"],
-        "CreationDate":   b["CreationDate"].isoformat(),
+        "CreationDate":   iso_z(b["CreationDate"]),
     } for b in raw_plans]
 
     if stats["failures"] == 0:
@@ -541,6 +551,10 @@ def main():
     parser.add_argument("--profile", metavar="PROFILE",     help="AWS profile to use (from ~/.aws/config)")
     args = parser.parse_args()
 
+    # Route SIGTERM through the same path as Ctrl+C, so a run killed by a
+    # timeout or a supervisor still writes out what it has collected.
+    signal.signal(signal.SIGTERM, lambda *_: (_ for _ in ()).throw(KeyboardInterrupt()))
+
     boto3.setup_default_session(profile_name=args.profile or None)
 
     include = [a.strip() for a in args.include.split(",")] if args.include else []
@@ -585,36 +599,51 @@ def main():
             "regions_failed":   0,
         }
         done = 0
+        interrupted = False
 
         with open(output_file, "w") as out:
-            with ThreadPoolExecutor(max_workers=MAX_ACCOUNT_WORKERS) as pool:
-                futures = {
-                    pool.submit(scan_account, acct, role_name, caller_account_id): acct
-                    for acct in accounts
-                }
-                for future in as_completed(futures):
-                    acct = futures[future]
-                    try:
-                        records = future.result()
-                    except Exception as e:           # noqa: BLE001
-                        reason = f"account scan failed unexpectedly: {condense(e)}"
-                        log(f"  [fail] {acct}: {reason}")
-                        records = [account_record(acct, "failed", reason)]
+            # Records are written as each account completes, so an interrupted
+            # run keeps everything already collected — a large org can easily be
+            # Ctrl+C'd or killed by a timeout. (DT-11095)
+            try:
+                with ThreadPoolExecutor(max_workers=MAX_ACCOUNT_WORKERS) as pool:
+                    futures = {
+                        pool.submit(scan_account, acct, role_name, caller_account_id): acct
+                        for acct in accounts
+                    }
+                    for future in as_completed(futures):
+                        acct = futures[future]
+                        try:
+                            records = future.result()
+                        except Exception as e:       # noqa: BLE001
+                            reason = f"account scan failed unexpectedly: {condense(e)}"
+                            log(f"  [fail] {acct}: {reason}")
+                            records = [account_record(acct, "failed", reason)]
 
-                    for record in records:
-                        out.write(json.dumps(record) + "\n")
-                        if record["record_type"] == "account":
-                            tally[f"accounts_{record['status']}"] += 1
-                        elif record["status"] == "ok":
-                            tally["regions_scanned"] += 1
-                        elif record["status"] == "partial":
-                            tally["regions_partial"] += 1
-                        else:
-                            tally["regions_failed"] += 1
+                        for record in records:
+                            out.write(json.dumps(record) + "\n")
+                            if record["record_type"] == "account":
+                                tally[f"accounts_{record['status']}"] += 1
+                            elif record["status"] == "ok":
+                                tally["regions_scanned"] += 1
+                            elif record["status"] == "partial":
+                                tally["regions_partial"] += 1
+                            else:
+                                tally["regions_failed"] += 1
 
-                    done += 1
-                    if records and records[0]["record_type"] == "region":
-                        log(f"  [{done}/{len(accounts)}] {acct} — {len(records)} regions")
+                        done += 1
+                        if records and records[0]["record_type"] == "region":
+                            log(f"  [{done}/{len(accounts)}] {acct} — {len(records)} regions")
+            except KeyboardInterrupt:
+                interrupted = True
+                log("\nInterrupted — writing out the results collected so far...")
+
+            # Accounts that never reported are still named, so the gap is visible.
+            if interrupted and done < len(accounts):
+                for acct in accounts[done:]:
+                    out.write(json.dumps(account_record(
+                        acct, "failed", "run interrupted before this account finished")) + "\n")
+                    tally["accounts_failed"] += 1
 
             # Last line of the file, so a truncated upload is obvious and coverage
             # is answerable from the shared file alone. (DT-11095)
@@ -622,6 +651,7 @@ def main():
                 "record_type":      "summary",
                 "tool_version":     VERSION,
                 "scanned_at":       now_utc(),
+                "interrupted":      interrupted,
                 "accounts_total":   len(accounts),
                 "accounts_scanned": len(accounts) - tally["accounts_skipped"] - tally["accounts_failed"],
                 "accounts_skipped": tally["accounts_skipped"],
@@ -632,6 +662,8 @@ def main():
             }
             out.write(json.dumps(summary) + "\n")
 
+        if interrupted:
+            log("\nRun was interrupted — the results below are partial.")
         log(f"\nAccounts: {summary['accounts_total']} total, {summary['accounts_scanned']} scanned, "
             f"{summary['accounts_skipped']} skipped, {summary['accounts_failed']} failed")
         log(f"Regions:  {summary['regions_scanned']} scanned, {summary['regions_partial']} partial, "

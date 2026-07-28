@@ -193,6 +193,29 @@ fetch_json() {
   return 1
 }
 
+# Reshape a raw payload with jq, recording a failure rather than silently
+# falling back to an empty array.
+#
+# A call can exit 0 and still return a body we cannot parse — a truncated read,
+# a proxy error page, a connection cut mid-response. Treating that as "[]" makes
+# a damaged region indistinguishable from an empty one, which is the same
+# failure that made DT-11095 so hard to diagnose.
+# Usage: transform_json SRC DST ERR_LOG LABEL FILTER
+transform_json() {
+  local src="$1" dst="$2" err_log="$3" label="$4" filter="$5"
+  local stderr_file="${dst}.stderr"
+
+  if jq "$filter" "$src" > "$dst" 2>"$stderr_file"; then
+    rm -f "$stderr_file"
+    return 0
+  fi
+
+  echo "[]" > "$dst"
+  printf '%s: %s\n' "$label" "$(error_message "$stderr_file")" >> "$err_log"
+  rm -f "$stderr_file"
+  return 1
+}
+
 # Assume a role and print export statements the caller can eval.
 # stderr is deliberately left alone so the caller can capture the AWS error and
 # report it as the skip reason.
@@ -355,45 +378,51 @@ scan_region() {
   fi
 
   # Transform each payload straight to disk — nothing is held in a shell
-  # variable or passed through argv.
-  jq '[.[]? | {
-    VolumeId,
-    Name: (.Tags // [] | map(select(.Key=="Name")) | first | .Value),
-    Size, VolumeType, State, Iops, Throughput, Encrypted, AvailabilityZone, SnapshotId,
-    InstanceId: (.Attachments // [] | first | .InstanceId),
-    Device:     (.Attachments // [] | first | .Device),
-    Tags: (.Tags // [])
-  }]' "$tmp/volumes.json" > "$tmp/out_volumes.json" 2>/dev/null \
-    || echo "[]" > "$tmp/out_volumes.json"
+  # variable or passed through argv. A parse failure counts as a failed call,
+  # so a damaged payload cannot masquerade as an empty region.
+  transform_json "$tmp/volumes.json" "$tmp/out_volumes.json" "$err_log" \
+    "parse ec2:DescribeVolumes" '[.[]? | {
+      VolumeId,
+      Name: (.Tags // [] | map(select(.Key=="Name")) | first | .Value),
+      Size, VolumeType, State, Iops, Throughput, Encrypted, AvailabilityZone, SnapshotId,
+      InstanceId: (.Attachments // [] | first | .InstanceId),
+      Device:     (.Attachments // [] | first | .Device),
+      Tags: (.Tags // [])
+    }]' || failures=$(( failures + 1 ))
 
-  jq '[.[]? as $r | $r.Instances[]? | {
-    InstanceId,
-    Name: (.Tags // [] | map(select(.Key=="Name")) | first | .Value),
-    InstanceType, State: .State.Name, Hypervisor, PlatformDetails, ImageId,
-    AvailabilityZone: .Placement.AvailabilityZone,
-    RootDeviceName, Architecture, OwnerId: $r.OwnerId,
-    Tags: (.Tags // [])
-  }]' "$tmp/reservations.json" > "$tmp/out_instances.json" 2>/dev/null \
-    || echo "[]" > "$tmp/out_instances.json"
+  transform_json "$tmp/reservations.json" "$tmp/out_instances.json" "$err_log" \
+    "parse ec2:DescribeInstances" '[.[]? as $r | $r.Instances[]? | {
+      InstanceId,
+      Name: (.Tags // [] | map(select(.Key=="Name")) | first | .Value),
+      InstanceType, State: .State.Name, Hypervisor, PlatformDetails, ImageId,
+      AvailabilityZone: .Placement.AvailabilityZone,
+      RootDeviceName, Architecture, OwnerId: $r.OwnerId,
+      Tags: (.Tags // [])
+    }]' || failures=$(( failures + 1 ))
 
-  jq '[.[]? | {
-    ImageId, Name, Description,
-    Platform: (.Platform // ""),
-    Architecture
-  }]' "$tmp/amis.json" > "$tmp/out_amis.json" 2>/dev/null \
-    || echo "[]" > "$tmp/out_amis.json"
+  transform_json "$tmp/amis.json" "$tmp/out_amis.json" "$err_log" \
+    "parse ec2:DescribeImages" '[.[]? | {
+      ImageId, Name, Description,
+      Platform: (.Platform // ""),
+      Architecture
+    }]' || failures=$(( failures + 1 ))
 
-  jq '[.[]? | {
-    SnapshotId, VolumeId, VolumeSize, StartTime, State, Encrypted,
-    Tags: (.Tags // [])
-  }]' "$tmp/snapshots.json" > "$tmp/out_snapshots.json" 2>/dev/null \
-    || echo "[]" > "$tmp/out_snapshots.json"
+  transform_json "$tmp/snapshots.json" "$tmp/out_snapshots.json" "$err_log" \
+    "parse ec2:DescribeSnapshots" '[.[]? | {
+      SnapshotId, VolumeId, VolumeSize,
+      StartTime: (.StartTime // "" | sub("\\+00:00$"; "Z")),
+      State, Encrypted,
+      Tags: (.Tags // [])
+    }]' || failures=$(( failures + 1 ))
 
-  jq '[.[]? | {PolicyId, Description, State, PolicyType}]' "$tmp/dlm.json" \
-    > "$tmp/out_dlm.json" 2>/dev/null || echo "[]" > "$tmp/out_dlm.json"
+  transform_json "$tmp/dlm.json" "$tmp/out_dlm.json" "$err_log" \
+    "parse dlm:GetLifecyclePolicies" \
+    '[.[]? | {PolicyId, Description, State, PolicyType}]' || failures=$(( failures + 1 ))
 
-  jq '[.[]? | {BackupPlanId, BackupPlanName, CreationDate}]' "$tmp/backup.json" \
-    > "$tmp/out_backup.json" 2>/dev/null || echo "[]" > "$tmp/out_backup.json"
+  transform_json "$tmp/backup.json" "$tmp/out_backup.json" "$err_log" \
+    "parse backup:ListBackupPlans" \
+    '[.[]? | {BackupPlanId, BackupPlanName,
+      CreationDate: (.CreationDate // "" | sub("\\+00:00$"; "Z"))}]' || failures=$(( failures + 1 ))
 
   local status="ok"
   if (( failures > 0 )); then
@@ -419,7 +448,6 @@ scan_region() {
 # non-zero status that the caller would have to guess the meaning of.
 scan_account() {
   local account_id="$1" caller_account_id="$2" role_name="$3" result_file="$4"
-  : > "$result_file"
 
   # Assume role in child accounts
   local role_env="" assume_err reason
@@ -487,12 +515,16 @@ scan_account() {
     throttle_region_jobs
     (
       [[ -n "$role_env" ]] && eval "$role_env"
+      # Write under a staging name and rename into place. A job killed mid-write
+      # then leaves a .partial file that the collector ignores, instead of a
+      # truncated record that would corrupt the JSONL.
       if result=$(scan_region "$account_id" "$region"); then
-        printf '%s\n' "$result" > "${tmp_dir}/${region}.json"
+        printf '%s\n' "$result" > "${tmp_dir}/${region}.partial"
       else
         region_failure_record "$account_id" "$region" \
-          "region scan failed unexpectedly" > "${tmp_dir}/${region}.json"
+          "region scan failed unexpectedly" > "${tmp_dir}/${region}.partial"
       fi
+      mv -f "${tmp_dir}/${region}.partial" "${tmp_dir}/${region}.json"
     ) &
     region_pids+=($!)
   done
@@ -512,10 +544,14 @@ scan_account() {
       "region scan produced no result (process terminated)" > "${tmp_dir}/${region}.json"
   done
 
+  # Assemble under a staging name too, so the collector only ever sees accounts
+  # that finished. An account still in flight when the run is interrupted
+  # contributes nothing rather than a half-written fragment.
   local count=0 f name failed_regions="" partial_regions=""
+  : > "${result_file}.partial"
   for f in "${tmp_dir}"/*.json; do
     [[ -f "$f" ]] || continue
-    cat "$f" >> "$result_file"
+    cat "$f" >> "${result_file}.partial"
     count=$(( count + 1 ))
     name=$(basename "$f" .json)
     if grep -q '"status":"failed"' "$f"; then
@@ -524,6 +560,7 @@ scan_account() {
       partial_regions="${partial_regions:+$partial_regions }$name"
     fi
   done
+  mv -f "${result_file}.partial" "$result_file"
   rm -rf "$tmp_dir"
 
   # Name the regions, not just the count — "3 failed" gives the operator nothing
@@ -734,17 +771,53 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# Ctrl+C / SIGTERM: kill all background jobs then exit (EXIT trap handles the rest)
-handle_interrupt() {
-  log ""
-  log "Interrupted — stopping all scans..."
-  local pids
-  pids=$(jobs -p 2>/dev/null) || true
-  [[ -n "$pids" ]] && echo "$pids" | xargs kill -TERM 2>/dev/null || true
-  wait 2>/dev/null || true
-  exit 130
+# Ctrl+C / SIGTERM: stop the scans, then still write out everything already
+# collected. A large org can easily be interrupted or hit a session limit — the
+# customer's first run timed out — and the accounts that already finished are
+# the most valuable thing on disk. Discarding them was a real data-loss bug.
+INTERRUPTED=false
+
+# TERM a job and everything below it. `jobs -p` only names the per-account
+# subshells; their region children — and the aws processes those are blocked on
+# — would otherwise keep running and stall the shutdown.
+kill_tree() {
+  local pid="$1" child
+  if command -v pgrep >/dev/null 2>&1; then
+    for child in $(pgrep -P "$pid" 2>/dev/null); do
+      kill_tree "$child"
+    done
+  fi
+  kill -TERM "$pid" 2>/dev/null || true
 }
-trap handle_interrupt INT TERM
+
+handle_interrupt() {
+  local signal="${1:-INT}"
+  log ""
+  log "Interrupted (SIG${signal}) — stopping all scans..."
+  INTERRUPTED=true
+
+  local pid
+  for pid in $(jobs -p 2>/dev/null); do
+    kill_tree "$pid"
+  done
+
+  # Give them a few seconds to die, then write out regardless. An API call that
+  # refuses to return must not cost us the results we already have.
+  local waited=0
+  while (( waited < 50 )) && [[ -n "$(jobs -p 2>/dev/null)" ]]; do
+    sleep 0.1
+    waited=$(( waited + 1 ))
+  done
+
+  finalize_output
+  # Conventional 128+signal, so a supervising script can tell the two apart.
+  case "$signal" in
+    TERM) exit 143 ;;
+    *)    exit 130 ;;
+  esac
+}
+trap 'handle_interrupt INT'  INT
+trap 'handle_interrupt TERM' TERM
 
 # Deploy StackSet if requested
 if [[ "$SETUP_ROLE" == true ]]; then
@@ -761,12 +834,92 @@ log ""
 log "Accounts to scan: ${#ACCOUNTS[@]}"
 [[ ${#ACCOUNTS[@]} -eq 0 ]] && fail "No accounts found to scan."
 
-# Output file
+# Output file. Checked up front — a scan that cannot write its results is worth
+# failing immediately, not after an hour of API calls.
 [[ -z "$OUTPUT" ]] && OUTPUT="discovery_$(date -u +%Y%m%d_%H%M%S).json"
-> "$OUTPUT"
+: > "$OUTPUT" 2>/dev/null || \
+  fail "cannot write output file '$OUTPUT' — check the directory exists and is writable."
 
 # Per-account result files, concatenated into $OUTPUT once every job is done.
-RESULT_DIR=$(make_tmpdir)
+RESULT_DIR=$(make_tmpdir 2>/dev/null) || \
+  fail "cannot create a temp directory under '${TMPDIR:-/tmp}' — set TMPDIR to a writable location."
+
+# Collect the per-account results into $OUTPUT and close the file with a summary.
+# Called on the normal path and from the interrupt handler, so an interrupted
+# run still yields everything that finished. Idempotent — whichever path gets
+# there first wins.
+FINALIZED=false
+finalize_output() {
+  [[ "$FINALIZED" == true ]] && return 0
+  FINALIZED=true
+  [[ -n "$RESULT_DIR" && -d "$RESULT_DIR" ]] || return 0
+
+  # Only completed accounts have a .jsonl; anything still staging is a .partial
+  # and is ignored, so the file is never left with a torn record.
+  find "$RESULT_DIR" -type f -name '*.jsonl' -exec cat {} + >> "$OUTPUT" 2>/dev/null || true
+
+  local reason="account scan produced no result (process terminated)"
+  [[ "$INTERRUPTED" == true ]] && reason="run interrupted before this account finished"
+
+  local account
+  for account in "${ACCOUNTS[@]+"${ACCOUNTS[@]}"}"; do
+    [[ -s "${RESULT_DIR}/${account}.jsonl" ]] && continue
+    account_record "$account" "failed" "$reason" >> "$OUTPUT"
+  done
+
+  # Tally in one streaming pass — the output can be gigabytes, so it is never
+  # slurped into memory.
+  local tally
+  tally=$(jq -r '"\(.record_type // "region"):\(.status // "-")"' "$OUTPUT" 2>/dev/null \
+          | sort | uniq -c | awk '{ print $2 "=" $1 }') || tally=""
+
+  tally_get() {
+    local v
+    v=$(printf '%s\n' "$tally" | grep "^$1=" | head -1 | cut -d= -f2)
+    echo "${v:-0}"
+  }
+
+  local total skipped failed scanned ok partial region_failed
+  total=${#ACCOUNTS[@]}
+  skipped=$(tally_get "account:skipped")
+  failed=$(tally_get "account:failed")
+  scanned=$(( total - skipped - failed ))
+  ok=$(tally_get "region:ok")
+  partial=$(tally_get "region:partial")
+  region_failed=$(tally_get "region:failed")
+
+  # Last line of the file, so a truncated upload is obvious and coverage is
+  # answerable from the shared file alone.
+  jq -nc \
+    --arg     tool_version      "$VERSION" \
+    --arg     scanned_at        "$(now_utc)" \
+    --argjson interrupted       "$INTERRUPTED" \
+    --argjson accounts_total    "$total" \
+    --argjson accounts_scanned  "$scanned" \
+    --argjson accounts_skipped  "$skipped" \
+    --argjson accounts_failed   "$failed" \
+    --argjson regions_scanned   "$ok" \
+    --argjson regions_partial   "$partial" \
+    --argjson regions_failed    "$region_failed" \
+    '{record_type: "summary", tool_version: $tool_version, scanned_at: $scanned_at,
+      interrupted: $interrupted,
+      accounts_total: $accounts_total, accounts_scanned: $accounts_scanned,
+      accounts_skipped: $accounts_skipped, accounts_failed: $accounts_failed,
+      regions_scanned: $regions_scanned, regions_partial: $regions_partial,
+      regions_failed: $regions_failed}' >> "$OUTPUT"
+
+  log ""
+  [[ "$INTERRUPTED" == true ]] && log "Run was interrupted — the results below are partial."
+  log "Accounts: $total total, $scanned scanned, $skipped skipped, $failed failed"
+  log "Regions:  $ok scanned, $partial partial, $region_failed failed"
+  log "Output:   $OUTPUT"
+  if (( skipped > 0 || failed > 0 || partial > 0 || region_failed > 0 )); then
+    log ""
+    log "Some accounts or regions were not fully scanned. Every one is recorded in"
+    log "$OUTPUT with a status and a reason — send the file as-is."
+  fi
+  return 0
+}
 
 # Scan accounts in parallel, capped at MAX_ACCOUNT_JOBS.
 # Uses only plain arrays and per-PID wait — compatible with bash 3.2 and zsh.
@@ -803,60 +956,4 @@ for pid in "${active_pids[@]+"${active_pids[@]}"}"; do
   wait "$pid" 2>/dev/null || true
 done
 
-# Assemble the output file from the per-account results.
-find "$RESULT_DIR" -type f -name '*.jsonl' -exec cat {} + >> "$OUTPUT" 2>/dev/null || true
-
-# Any account that produced no file at all was killed before it could report.
-for account in "${ACCOUNTS[@]+"${ACCOUNTS[@]}"}"; do
-  [[ -s "${RESULT_DIR}/${account}.jsonl" ]] && continue
-  account_record "$account" "failed" "account scan produced no result (process terminated)" \
-    >> "$OUTPUT"
-done
-
-# ── Summary ────────────────────────────────────────────────────────────────────
-# Tally in one streaming pass — the output can be gigabytes, so it is never
-# slurped into memory.
-TALLY=$(jq -r '"\(.record_type // "region"):\(.status // "-")"' "$OUTPUT" 2>/dev/null \
-        | sort | uniq -c | awk '{ print $2 "=" $1 }') || TALLY=""
-
-tally_get() {
-  local v
-  v=$(printf '%s\n' "$TALLY" | grep "^$1=" | head -1 | cut -d= -f2)
-  echo "${v:-0}"
-}
-
-ACCOUNTS_TOTAL=${#ACCOUNTS[@]}
-ACCOUNTS_SKIPPED=$(tally_get "account:skipped")
-ACCOUNTS_FAILED=$(tally_get "account:failed")
-ACCOUNTS_SCANNED=$(( ACCOUNTS_TOTAL - ACCOUNTS_SKIPPED - ACCOUNTS_FAILED ))
-REGIONS_SCANNED=$(tally_get "region:ok")
-REGIONS_PARTIAL=$(tally_get "region:partial")
-REGIONS_FAILED=$(tally_get "region:failed")
-
-# Last line of the file, so a truncated upload is obvious and coverage is
-# answerable from the shared file alone.
-jq -nc \
-  --arg     tool_version      "$VERSION" \
-  --arg     scanned_at        "$(now_utc)" \
-  --argjson accounts_total    "$ACCOUNTS_TOTAL" \
-  --argjson accounts_scanned  "$ACCOUNTS_SCANNED" \
-  --argjson accounts_skipped  "$ACCOUNTS_SKIPPED" \
-  --argjson accounts_failed   "$ACCOUNTS_FAILED" \
-  --argjson regions_scanned   "$REGIONS_SCANNED" \
-  --argjson regions_partial   "$REGIONS_PARTIAL" \
-  --argjson regions_failed    "$REGIONS_FAILED" \
-  '{record_type: "summary", tool_version: $tool_version, scanned_at: $scanned_at,
-    accounts_total: $accounts_total, accounts_scanned: $accounts_scanned,
-    accounts_skipped: $accounts_skipped, accounts_failed: $accounts_failed,
-    regions_scanned: $regions_scanned, regions_partial: $regions_partial,
-    regions_failed: $regions_failed}' >> "$OUTPUT"
-
-log ""
-log "Accounts: $ACCOUNTS_TOTAL total, $ACCOUNTS_SCANNED scanned, $ACCOUNTS_SKIPPED skipped, $ACCOUNTS_FAILED failed"
-log "Regions:  $REGIONS_SCANNED scanned, $REGIONS_PARTIAL partial, $REGIONS_FAILED failed"
-log "Output:   $OUTPUT"
-if (( ACCOUNTS_SKIPPED > 0 || ACCOUNTS_FAILED > 0 || REGIONS_PARTIAL > 0 || REGIONS_FAILED > 0 )); then
-  log ""
-  log "Some accounts or regions were not fully scanned. Every one is recorded in"
-  log "$OUTPUT with a status and a reason — send the file as-is."
-fi
+finalize_output

@@ -71,9 +71,27 @@ against a mock AWS CLI — no AWS account or credentials needed:
 which calls should be denied), so a case can describe the org it needs — from a
 two-account smoke test to a region holding 4000 volumes.
 
-Cases live in `test/cases/`. `01`, `02` and `03` are stress tests that reproduce
-the `Argument list too long` failures and the resulting silent data loss;
-`04`, `05` and `06` cover the skipped/failed reporting.
+Cases live in `test/cases/`:
+
+| Case | Covers |
+|---|---|
+| `00_smoke` | A healthy small org produces the documented records |
+| `01_stress_large_region` | 4000 volumes — the `jq: Argument list too long` crash |
+| `02_stress_many_accounts` | 12 accounts × 4 regions — no lost or duplicated records |
+| `03_stress_many_amis` | 3000 distinct AMIs — the `describe-images` argv overflow |
+| `04_region_failure_vs_empty` | An empty region is distinguishable from a denied one |
+| `05_account_skipped_reported` | Unreachable accounts appear in the file, with a reason |
+| `06_summary_record` | Coverage is answerable from the output alone |
+| `07_interrupt_preserves_data` | A killed run keeps what it already collected |
+| `08_credential_expiry` | An expired session is reported, never shown as empty |
+| `09_concurrency_ceiling` | Peak parallel calls stay within the RAM-derived cap |
+| `10_corrupt_payload` | An unparseable response is reported, not read as empty |
+| `11_pagination_not_capped` | Nothing disables or caps AWS CLI pagination |
+| `12_write_failures` | An unwritable output or temp dir fails loudly |
+
+For cross-implementation coverage see `test/parity/` in the repository root,
+which runs bash, Python and Go against a shared fake AWS endpoint and diffs
+their output.
 
 ## macOS note
 

@@ -18,6 +18,15 @@
 #   MOCK_DENY_VOLUMES        "<account>/<region>" pairs where ec2:DescribeVolumes fails
 #   MOCK_DENY_ALL            "<account>/<region>" pairs where every data call fails
 #                            (models an opted-out or auth-blocked region)
+#   MOCK_STATE_DIR           directory for cross-process bookkeeping, set by the
+#                            harness; required by the options below
+#   MOCK_DELAY_SECONDS       sleep this long before answering a data call
+#   MOCK_DELAY_ACCOUNTS      accounts the delay applies to (default: all)
+#   MOCK_EXPIRE_AFTER        after this many data calls org-wide, every further
+#                            data call fails with ExpiredToken — models the 1h
+#                            assume-role session outliving a long scan
+#   MOCK_CORRUPT_OPS         operations that return truncated, unparseable JSON
+#   MOCK_CORRUPT_REGIONS     regions the corruption applies to (default: all)
 #
 # The mock learns which account it is impersonating from AWS_ACCESS_KEY_ID:
 # assume-role hands back the sentinel key "AKIAMOCK<account-id>", mirroring how
@@ -184,6 +193,55 @@ if [[ "$SERVICE" != "sts" && "$SERVICE" != "organizations" \
       && "$OPERATION" != "describe-regions" ]] \
    && csv_contains "${MOCK_DENY_ALL:-}" "${ACCOUNT}/${REGION}"; then
   die_access_denied "$OPERATION"
+fi
+
+# ── Data-call behaviours ───────────────────────────────────────────────────────
+# The inventory calls are the ones worth instrumenting: they are what runs
+# concurrently, what a long scan outlives, and what returns bulk payloads.
+
+is_data_call() {
+  case "$SERVICE $OPERATION" in
+    "ec2 describe-volumes"|"ec2 describe-instances"|"ec2 describe-snapshots"|\
+    "ec2 describe-images"|"dlm get-lifecycle-policies"|"backup list-backup-plans")
+      return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+if is_data_call && [[ -n "${MOCK_STATE_DIR:-}" ]]; then
+  # Concurrency accounting: register while in flight and record how many other
+  # data calls were live at that moment, so a test can assert the peak.
+  mkdir -p "$MOCK_STATE_DIR/live" 2>/dev/null || true
+  : > "$MOCK_STATE_DIR/live/$$" 2>/dev/null || true
+  trap 'rm -f "$MOCK_STATE_DIR/live/$$" 2>/dev/null' EXIT
+  ls "$MOCK_STATE_DIR/live" 2>/dev/null | grep -c . >> "$MOCK_STATE_DIR/peak.log" 2>/dev/null || true
+fi
+
+if is_data_call; then
+  # Hold the call open, so a test can act while the scan is genuinely in flight.
+  if [[ -n "${MOCK_DELAY_SECONDS:-}" ]] \
+     && { [[ -z "${MOCK_DELAY_ACCOUNTS:-}" ]] || csv_contains "${MOCK_DELAY_ACCOUNTS}" "$ACCOUNT"; }; then
+    sleep "$MOCK_DELAY_SECONDS"
+  fi
+
+  # Session expiry. Assumed credentials last an hour; a 900-account scan can
+  # outlive that, after which every call fails for the rest of the run.
+  if [[ -n "${MOCK_EXPIRE_AFTER:-}" && -n "${MOCK_STATE_DIR:-}" ]]; then
+    printf 'x' >> "$MOCK_STATE_DIR/calls"
+    calls_made=$(wc -c < "$MOCK_STATE_DIR/calls" 2>/dev/null || echo 0)
+    if (( calls_made > MOCK_EXPIRE_AFTER )); then
+      echo "An error occurred (ExpiredToken) when calling the $OPERATION operation: The security token included in the request is expired" >&2
+      exit 254
+    fi
+  fi
+
+  # A response that exits 0 but is not parseable JSON — a truncated read, a
+  # proxy error page, a connection cut mid-body.
+  if csv_contains "${MOCK_CORRUPT_OPS:-}" "$OPERATION" \
+     && { [[ -z "${MOCK_CORRUPT_REGIONS:-}" ]] || csv_contains "${MOCK_CORRUPT_REGIONS}" "$REGION"; }; then
+    printf '[{"VolumeId":"vol-00000000000000001","Size":100,"Tags":[{"Key":"Na'
+    exit 0
+  fi
 fi
 
 case "$SERVICE $OPERATION" in
