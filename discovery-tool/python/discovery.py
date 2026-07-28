@@ -23,6 +23,7 @@ Usage:
 
 import argparse
 import json
+import os
 import signal
 import sys
 import time
@@ -30,6 +31,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 
 import boto3
+from botocore.config import Config
 from botocore.exceptions import ClientError, NoCredentialsError, PartialCredentialsError
 
 # ── Configuration ──────────────────────────────────────────────────────────────
@@ -43,6 +45,28 @@ MAX_ACCOUNT_WORKERS = 20     # accounts scanned in parallel
 MAX_REGION_WORKERS  = 10     # regions scanned in parallel per account
 AMI_BATCH_SIZE      = 100    # DescribeImages rejects unbounded ImageIds lists
 MAX_ERROR_CHARS     = 400    # keep error strings readable in the output file
+
+# Retry policy. A 900-account scan makes tens of thousands of API calls and AWS
+# will throttle it; "standard" retries the throttling codes with exponential
+# backoff and jitter. Pinned rather than left to the client default: boto3 still
+# defaults to "legacy" while the AWS CLI and the Go SDK default to "standard",
+# so the three would ride out a burst differently. A call that runs out of
+# retries costs a region — reported as degraded, but still a coverage gap.
+#
+# Not "adaptive": that mode keeps a client-side rate limiter in memory, and the
+# bash implementation spawns a fresh CLI process per call, so it could not carry
+# one between calls. Keeping all three on "standard" keeps them comparable.
+#
+# An operator can still override either from the environment.
+RETRY_MODE          = os.environ.get("AWS_RETRY_MODE") or "standard"
+RETRY_MAX_ATTEMPTS  = int(os.environ.get("AWS_MAX_ATTEMPTS") or 10)
+
+# "total_max_attempts", not "max_attempts": in a botocore Config the latter means
+# the number of *retries*, which botocore turns into max_attempts + 1 attempts.
+# The AWS_MAX_ATTEMPTS environment variable and the Go SDK both count total
+# attempts, so using "max_attempts" here would quietly give Python one more try
+# than the other two for the same setting.
+BOTO_CONFIG = Config(retries={"mode": RETRY_MODE, "total_max_attempts": RETRY_MAX_ATTEMPTS})
 
 # ── IAM role template deployed to each child account ──────────────────────────
 # Grants only the describe/list permissions this script actually calls.
@@ -183,7 +207,7 @@ def session_for_account(account_id, role_name, caller_account_id):
     """
     if account_id == caller_account_id:
         return boto3.Session(profile_name=boto3.DEFAULT_SESSION.profile_name)
-    sts = boto3.client("sts")
+    sts = boto3.client("sts", config=BOTO_CONFIG)
     creds = sts.assume_role(
         RoleArn=f"arn:aws:iam::{account_id}:role/{role_name}",
         RoleSessionName=SESSION_NAME,
@@ -219,7 +243,7 @@ def scan_region(session, account_id, region):
             errors.append(f"{api}: {condense(e)}")
             return default
 
-    ec2 = session.client("ec2", region_name=region)
+    ec2 = session.client("ec2", region_name=region, config=BOTO_CONFIG)
 
     # EBS Volumes
     raw_volumes = attempt(
@@ -305,7 +329,7 @@ def scan_region(session, account_id, region):
     } for s in raw_snapshots]
 
     # DLM lifecycle policies
-    dlm = session.client("dlm", region_name=region)
+    dlm = session.client("dlm", region_name=region, config=BOTO_CONFIG)
     dlm_policies = attempt(
         "dlm:GetLifecyclePolicies",
         lambda: dlm.get_lifecycle_policies().get("Policies", []),
@@ -313,7 +337,7 @@ def scan_region(session, account_id, region):
     )
 
     # AWS Backup plans
-    backup_client = session.client("backup", region_name=region)
+    backup_client = session.client("backup", region_name=region, config=BOTO_CONFIG)
     raw_plans = attempt(
         "backup:ListBackupPlans",
         lambda: paginate(backup_client, "list_backup_plans", "BackupPlansList"),
@@ -366,7 +390,7 @@ def scan_account(account_id, role_name, caller_account_id):
         return [account_record(account_id, "skipped", reason)]
 
     try:
-        ec2 = session.client("ec2", region_name="us-east-1")
+        ec2 = session.client("ec2", region_name="us-east-1", config=BOTO_CONFIG)
         regions = [r["RegionName"] for r in ec2.describe_regions()["Regions"]]
     except Exception as e:                           # noqa: BLE001
         reason = f"cannot list regions: {condense(e)}"
@@ -417,7 +441,7 @@ def list_accounts(ou, include, exclude):
     """Return the list of account IDs to scan."""
     if include:
         return [a for a in include if a not in exclude]
-    org = boto3.client("organizations")
+    org = boto3.client("organizations", config=BOTO_CONFIG)
     if ou:
         raw = paginate(org, "list_accounts_for_parent", "Accounts", ParentId=ou)
     else:
@@ -428,7 +452,7 @@ def list_accounts(ou, include, exclude):
 # ── StackSet lifecycle ─────────────────────────────────────────────────────────
 
 def _get_root_ou_id():
-    org = boto3.client("organizations")
+    org = boto3.client("organizations", config=BOTO_CONFIG)
     return org.list_roots()["Roots"][0]["Id"]
 
 
@@ -456,7 +480,7 @@ def _wait_for_stackset_op(cf, operation_id):
 
 def deploy_stackset(management_account_id, ou, include):
     """Create StackSet and deploy DatafyDiscoveryRole to all target accounts."""
-    cf = boto3.client("cloudformation")
+    cf = boto3.client("cloudformation", config=BOTO_CONFIG)
 
     log(f"Creating StackSet '{STACKSET_NAME}'...")
     try:
@@ -497,7 +521,7 @@ def deploy_stackset(management_account_id, ou, include):
 
 def teardown_stackset(ou, include):
     """Delete all stack instances then the StackSet itself."""
-    cf = boto3.client("cloudformation")
+    cf = boto3.client("cloudformation", config=BOTO_CONFIG)
     log(f"Removing StackSet '{STACKSET_NAME}'...")
 
     try:
@@ -579,7 +603,7 @@ def main():
     exclude = {a.strip() for a in args.exclude.split(",")} if args.exclude else set()
 
     try:
-        identity = boto3.client("sts").get_caller_identity()
+        identity = boto3.client("sts", config=BOTO_CONFIG).get_caller_identity()
     except (NoCredentialsError, PartialCredentialsError):
         print(
             "Error: no AWS credentials found.\n\n"

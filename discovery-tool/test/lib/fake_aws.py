@@ -38,6 +38,13 @@ Scenario (a JSON file named by FAKE_AWS_SCENARIO):
       "expire_after": 12,      after N data calls org-wide, the rest fail
                                with ExpiredToken
 
+      "throttle": {            reject this many attempts of an action before
+        "DescribeVolumes": 2   answering it, counted per account/region/action —
+      },                       models a burst the client should ride out
+      "throttle_forever": [    actions throttled on every attempt, so the
+        "DescribeSnapshots"    client exhausts its retries and gives up
+      ],
+
       "corrupt": {             region -> actions that return an unparseable body
         "us-east-1": ["DescribeVolumes"]
       },
@@ -78,9 +85,13 @@ STATS = {
     "peak_calls":    0,   # most data calls ever in flight at once
     "peak_accounts": 0,   # most distinct accounts ever in flight at once
     "max_image_ids": 0,   # largest ImageIds list seen on one DescribeImages
+    "throttled":     0,   # attempts answered with a throttling error
 }
 IN_FLIGHT_CALLS = 0
 IN_FLIGHT_ACCOUNTS = {}   # account id -> in-flight call count
+
+THROTTLE_LOCK = threading.Lock()
+THROTTLE_SEEN = {}        # "account/region/action" -> attempts seen so far
 
 
 # ── Scenario helpers ───────────────────────────────────────────────────────────
@@ -375,6 +386,33 @@ def apply_delay(account):
     time.sleep(float(seconds))
 
 
+def throttled(account, region, action):
+    """Whether this attempt should be answered with a throttling error.
+
+    A 900-account scan makes tens of thousands of calls and AWS will push back.
+    Every client retries throttling with exponential backoff, so what matters is
+    whether the tool rides the burst out — hence the per-attempt counter: the
+    first N attempts of a given account/region/action fail, and the attempt
+    after that succeeds, which only happens if the client actually retried.
+    """
+    forever = SCENARIO.get("throttle_forever") or []
+    limit = int((SCENARIO.get("throttle") or {}).get(action, 0) or 0)
+    if action not in forever and limit <= 0:
+        return False
+
+    if action not in forever:
+        key = f"{account}/{region}/{action}"
+        with THROTTLE_LOCK:
+            seen = THROTTLE_SEEN.get(key, 0) + 1
+            THROTTLE_SEEN[key] = seen
+        if seen > limit:
+            return False
+
+    with STATS_LOCK:
+        STATS["throttled"] += 1
+    return True
+
+
 def session_expired():
     """Assumed credentials last an hour; a 900-account scan can outlive that,
     after which every remaining call fails for the rest of the run."""
@@ -450,6 +488,18 @@ class Handler(BaseHTTPRequestHandler):
         if denied(account, region, action):
             self._error("UnauthorizedOperation", f"mock denial for {action}",
                         service=service)
+            return True
+        if throttled(account, region, action):
+            # EC2 says RequestLimitExceeded with a 503; the JSON-protocol
+            # services say ThrottlingException with a 400. Both codes are in
+            # every client's retryable set, which is the point — a client that
+            # does not retry them fails this call outright.
+            if service in JSON_SERVICES:
+                self._error("ThrottlingException", "Rate exceeded",
+                            status=400, service=service)
+            else:
+                self._error("RequestLimitExceeded", "Request limit exceeded",
+                            status=503, service=service)
             return True
         if session_expired():
             self._error("ExpiredToken",

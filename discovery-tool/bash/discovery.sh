@@ -9,6 +9,20 @@ set -euo pipefail
 # Disable AWS CLI v2 pager — prevents interactive prompts in scripts
 export AWS_PAGER=""
 
+# Retry policy. A 900-account scan makes tens of thousands of API calls and AWS
+# will throttle it; "standard" retries the throttling codes with exponential
+# backoff and jitter. Pinned here rather than left to the client default,
+# because the three implementations ship different defaults and a call that
+# runs out of retries costs a region — reported as degraded, but still a gap.
+#
+# Not "adaptive": that mode keeps a client-side rate limiter in memory, and this
+# implementation spawns a fresh CLI process per call, so it would have nothing
+# to carry between them and would quietly mean less here than in Python or Go.
+#
+# An operator can still override either from the environment.
+export AWS_RETRY_MODE="${AWS_RETRY_MODE:-standard}"
+export AWS_MAX_ATTEMPTS="${AWS_MAX_ATTEMPTS:-10}"
+
 # ── Constants ──────────────────────────────────────────────────────────────────
 
 VERSION="0.2.0"

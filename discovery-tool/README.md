@@ -124,6 +124,33 @@ Each child account role (whether `OrganizationAccountAccessRole`, a custom role,
 
 The role must also trust the management account: `"Principal": {"AWS": "arn:aws:iam::<mgmt-account-id>:root"}`.
 
+## Rate limits and retries
+
+A scan of a large organization makes tens of thousands of API calls, and AWS
+throttles it long before the end. All three implementations pin the same retry
+policy — AWS **standard** mode, **10 attempts**, exponential backoff with jitter
+— so a throttled call is ridden out rather than lost.
+
+This is pinned rather than left to each client's default, because the defaults
+disagree: boto3 still ships `legacy` mode while the AWS CLI and the Go SDK ship
+`standard`. Two overrides are honoured, if you need to tune for a particularly
+tight account:
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `AWS_RETRY_MODE` | `standard` | AWS retry mode |
+| `AWS_MAX_ATTEMPTS` | `10` | **Total** attempts per call, first one included |
+
+`adaptive` mode is deliberately not the default. It keeps a client-side rate
+limiter in memory, and the bash implementation spawns a fresh AWS CLI process
+per call — it would have nothing to carry between them, so the same setting
+would quietly mean less in bash than in Python or Go.
+
+If a call does exhaust its attempts, the region is recorded as `partial` or
+`failed` with the AWS error code in `errors` — it is never reported as an empty
+region. So throttling costs coverage visibly, and `tail -1` on the output tells
+you it happened.
+
 ## Scope options
 
 By default the tool scans all accounts in the organization. Use these flags to narrow scope:
@@ -201,6 +228,7 @@ test one of the three.
 | `11_pagination` | Multi-page result sets arrive whole, on every client |
 | `12_unwritable_output` | An unwritable `--output` path fails loudly and early |
 | `13_diagnostics_on_stderr` | The file is the only product; stdout stays clean |
+| `14_throttling_retried` | A throttled call is retried with backoff, and reported if it runs out |
 
 ### The parity harness — `test/parity/`
 
