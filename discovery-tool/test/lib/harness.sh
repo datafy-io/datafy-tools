@@ -96,6 +96,11 @@ teardown_sandbox() {
 # scenario <<'JSON' ... JSON — describe the org this case needs.
 scenario() { cat > "$SCENARIO_FILE"; }
 
+# Apply a new scenario within a case. The endpoint reads its scenario once at
+# startup, so it has to be restarted — which also resets the bookkeeping that
+# /__stats reports, giving the second run a clean slate.
+restart_fake() { stop_fake; FAKE_PORT=""; return 0; }
+
 start_fake() {
   [[ -n "${FAKE_PID:-}" ]] && return 0
 

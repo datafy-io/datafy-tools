@@ -22,6 +22,7 @@ import (
 	"os"
 	"os/signal"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -56,6 +57,17 @@ const (
 	amiBatchSize = 100
 	// Keep error strings readable in the output file.
 	maxErrorChars = 400
+	// Retry policy. A 900-account scan makes tens of thousands of API calls and
+	// AWS will throttle it; standard mode retries the throttling codes with
+	// exponential backoff and jitter. Pinned rather than left to the SDK
+	// default, because the three implementations ship different defaults and a
+	// call that runs out of retries costs a region.
+	//
+	// Not adaptive mode: it keeps a client-side rate limiter in memory, and the
+	// bash implementation spawns a fresh CLI process per call, so it could not
+	// carry one between calls. Keeping all three on standard keeps them
+	// comparable. Both settings are overridable from the environment.
+	defaultRetryMaxAttempts = 10
 )
 
 // IAM role CloudFormation template deployed to each child account.
@@ -298,8 +310,30 @@ func nameFromEC2Tags(tags []ec2types.Tag) *string {
 
 // ── AWS helpers ────────────────────────────────────────────────────────────────
 
+// retryOptions pins the retry policy, honouring AWS_RETRY_MODE and
+// AWS_MAX_ATTEMPTS when an operator has set them. Every client is built from
+// the config this returns, so they all share one policy.
+func retryOptions() []func(*config.LoadOptions) error {
+	mode := aws.RetryModeStandard
+	if v := os.Getenv("AWS_RETRY_MODE"); v != "" {
+		if parsed, err := aws.ParseRetryMode(v); err == nil {
+			mode = parsed
+		}
+	}
+	attempts := defaultRetryMaxAttempts
+	if v := os.Getenv("AWS_MAX_ATTEMPTS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			attempts = n
+		}
+	}
+	return []func(*config.LoadOptions) error{
+		config.WithRetryMode(mode),
+		config.WithRetryMaxAttempts(attempts),
+	}
+}
+
 func loadBaseConfig(ctx context.Context, profile string) (aws.Config, error) {
-	var opts []func(*config.LoadOptions) error
+	opts := retryOptions()
 	if profile != "" {
 		opts = append(opts, config.WithSharedConfigProfile(profile))
 	}
