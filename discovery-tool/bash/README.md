@@ -56,6 +56,43 @@ chmod +x discovery.sh
 --output     FILE   Output file (default: discovery_<timestamp>.json)
 ```
 
+## Tests
+
+**Most of the coverage for this implementation lives in `test/` at the
+repository root**, not here. That suite runs every behavioural case against
+bash, Python and Go alike, driving the real AWS CLI against a fake AWS endpoint:
+
+```bash
+../test/run_tests.sh --impl bash        # every case, bash only
+../test/run_tests.sh --impl bash 01 04  # only cases matching these patterns
+../test/run_tests.sh                    # all three implementations
+```
+
+What lives here is the handful of checks that are properties of `discovery.sh`
+itself rather than of the records it produces, and so have no Python or Go
+counterpart:
+
+```bash
+./test/run_tests.sh          # all cases
+./test/run_tests.sh 00       # only cases matching these patterns
+```
+
+| Case | Covers |
+|---|---|
+| `00_pagination_flags` | Nothing disables or caps AWS CLI pagination |
+| `01_tmpdir_failure` | An unwritable `$TMPDIR` fails loudly, and names the variable to change |
+
+`--no-paginate`, `--max-items` and `--page-size` each make the CLI return a
+prefix of the data and exit 0, which looks exactly like a small account rather
+than a truncated scan. Python and Go have no equivalent — their paginators are
+types, not flags. `$TMPDIR` matters here because only the bash implementation
+stages its records through it, writing a file per region and per account and
+concatenating them at the end.
+
+`test/lib/mock_aws.sh` is installed on `PATH` as `aws` and is driven by `MOCK_*`
+environment variables (account list, region list, resource counts), so these
+cases need neither `python3` nor `go`.
+
 ## macOS note
 
 macOS ships with bash 3.2, which does not support `mapfile` or associative arrays. Install a modern bash:
