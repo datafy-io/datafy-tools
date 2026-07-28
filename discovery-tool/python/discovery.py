@@ -114,7 +114,14 @@ DISCOVERY_ROLE_TEMPLATE = json.dumps({
 # ── Utilities ──────────────────────────────────────────────────────────────────
 
 def log(msg):
-    print(msg, flush=True)
+    """Progress and diagnostics, on stderr.
+
+    The tool has one product — the JSONL file named by --output — and stdout is
+    left clean for the caller. An operator who redirects stdout must still see
+    that accounts were skipped; problems scrolling into /dev/null is part of how
+    DT-11095 stayed invisible. bash and Go do the same.
+    """
+    print(msg, file=sys.stderr, flush=True)
 
 
 def paginate(client, method, key, **kwargs):
@@ -553,7 +560,18 @@ def main():
 
     # Route SIGTERM through the same path as Ctrl+C, so a run killed by a
     # timeout or a supervisor still writes out what it has collected.
-    signal.signal(signal.SIGTERM, lambda *_: (_ for _ in ()).throw(KeyboardInterrupt()))
+    #
+    # Which signal arrived is remembered so the process can exit 128+signal the
+    # way bash and Go do. A supervising script has to be able to tell an
+    # interrupted run from a clean one; exiting 0 after an interrupt claims the
+    # scan covered the whole org when it did not. (DT-11095)
+    interrupt_signal = [signal.SIGINT]
+
+    def _on_sigterm(signum, _frame):
+        interrupt_signal[0] = signum
+        raise KeyboardInterrupt()
+
+    signal.signal(signal.SIGTERM, _on_sigterm)
 
     boto3.setup_default_session(profile_name=args.profile or None)
 
@@ -601,7 +619,18 @@ def main():
         done = 0
         interrupted = False
 
-        with open(output_file, "w") as out:
+        # Checked up front — a scan that cannot write its results is worth
+        # failing immediately, not after an hour of API calls. The message has
+        # to name the path: an unhandled OSError tells the operator the tool
+        # broke, not that their --output argument is wrong.
+        try:
+            out_file = open(output_file, "w")
+        except OSError as e:
+            print(f"Error: cannot write output file '{output_file}' — {e.strerror}. "
+                  "Check the directory exists and is writable.", file=sys.stderr)
+            sys.exit(1)
+
+        with out_file as out:
             # Records are written as each account completes, so an interrupted
             # run keeps everything already collected — a large org can easily be
             # Ctrl+C'd or killed by a timeout. (DT-11095)
@@ -673,6 +702,12 @@ def main():
                                     "regions_partial", "regions_failed")):
             log("\nSome accounts or regions were not fully scanned. Every one is recorded in")
             log(f"{output_file} with a status and a reason — send the file as-is.")
+
+        # Conventional 128+signal, matching bash and Go, so a wrapper can tell
+        # an interrupted run from a complete one. The results written above are
+        # still valid — just partial.
+        if interrupted:
+            sys.exit(128 + interrupt_signal[0])
 
     finally:
         if args.setup_role:

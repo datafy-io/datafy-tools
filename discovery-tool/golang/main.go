@@ -235,6 +235,17 @@ func newAccountRecord(accountId, status, reason string) AccountRecord {
 	}
 }
 
+// logf writes progress and diagnostics to stderr.
+//
+// The tool has exactly one product — the JSONL file named by -output — so
+// stdout is left clean for the caller. An operator who redirects stdout must
+// still see that accounts were skipped; problems scrolling past into /dev/null
+// is part of how DT-11095 stayed invisible. bash and Python do the same.
+// -version is the one thing that still goes to stdout: there it is the output.
+func logf(format string, args ...any) {
+	fmt.Fprintf(os.Stderr, format, args...)
+}
+
 // condense squashes an error into one short line fit for a JSON field.
 func condense(err error) string {
 	s := strings.Join(strings.Fields(err.Error()), " ")
@@ -687,7 +698,7 @@ func waitForStackSetOp(ctx context.Context, cfClient *cloudformation.Client, opI
 		case cfntypes.StackSetOperationStatusFailed, cfntypes.StackSetOperationStatusStopped:
 			return fmt.Errorf("stackset operation ended with status: %s", resp.StackSetOperation.Status)
 		}
-		fmt.Println("  Waiting for StackSet operation to complete...")
+		logf("  Waiting for StackSet operation to complete...\n")
 		time.Sleep(15 * time.Second)
 	}
 }
@@ -695,7 +706,7 @@ func waitForStackSetOp(ctx context.Context, cfClient *cloudformation.Client, opI
 func deployStackSet(ctx context.Context, cfg aws.Config, mgmtAccountId, ou string, include []string) error {
 	cfClient := cloudformation.NewFromConfig(cfg)
 
-	fmt.Printf("Creating StackSet '%s'...\n", stackSetName)
+	logf("Creating StackSet '%s'...\n", stackSetName)
 	_, err := cfClient.CreateStackSet(ctx, &cloudformation.CreateStackSetInput{
 		StackSetName: aws.String(stackSetName),
 		Description:  aws.String("Datafy Discovery — read-only role. Created by discovery tool, auto-deleted after scan."),
@@ -712,7 +723,7 @@ func deployStackSet(ctx context.Context, cfg aws.Config, mgmtAccountId, ou strin
 		return fmt.Errorf("create stack set: %w", err)
 	}
 	if err != nil {
-		fmt.Printf("  StackSet '%s' already exists — reusing it.\n", stackSetName)
+		logf("  StackSet '%s' already exists — reusing it.\n", stackSetName)
 	}
 
 	targets, err := stackSetTargets(ctx, cfg, ou, include)
@@ -720,7 +731,7 @@ func deployStackSet(ctx context.Context, cfg aws.Config, mgmtAccountId, ou strin
 		return err
 	}
 
-	fmt.Println("Deploying role to accounts (this may take a few minutes)...")
+	logf("Deploying role to accounts (this may take a few minutes)...\n")
 	opResp, err := cfClient.CreateStackInstances(ctx, &cloudformation.CreateStackInstancesInput{
 		StackSetName:      aws.String(stackSetName),
 		DeploymentTargets: targets,
@@ -737,13 +748,13 @@ func deployStackSet(ctx context.Context, cfg aws.Config, mgmtAccountId, ou strin
 	if err := waitForStackSetOp(ctx, cfClient, aws.ToString(opResp.OperationId)); err != nil {
 		return err
 	}
-	fmt.Println("Role deployed.")
+	logf("Role deployed.\n")
 	return nil
 }
 
 func teardownStackSet(ctx context.Context, cfg aws.Config, ou string, include []string) {
 	cfClient := cloudformation.NewFromConfig(cfg)
-	fmt.Printf("Removing StackSet '%s'...\n", stackSetName)
+	logf("Removing StackSet '%s'...\n", stackSetName)
 
 	targets, err := stackSetTargets(ctx, cfg, ou, include)
 	if err != nil {
@@ -780,7 +791,7 @@ func teardownStackSet(ctx context.Context, cfg aws.Config, ou string, include []
 		fmt.Fprintf(os.Stderr, "  Please delete StackSet '%s' manually in CloudFormation.\n", stackSetName)
 		return
 	}
-	fmt.Println("StackSet removed.")
+	logf("StackSet removed.\n")
 }
 
 // ── Entry point ────────────────────────────────────────────────────────────────
@@ -820,13 +831,20 @@ func main() {
 	// A large org can easily be Ctrl+C'd or killed by a timeout. Cancel the
 	// scan but still fall through to writing the summary, so everything already
 	// encoded to the file stays usable. (DT-11095)
-	var interrupted int32
+	//
+	// Which signal arrived is remembered so the process can exit 128+signal,
+	// the way bash and Python do: 130 for Ctrl+C, 143 for a timeout or a
+	// supervisor. A wrapper that sees only "143" cannot tell those apart.
+	var interrupted, interruptSignal int32
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
 	go func() {
 		sig := <-sigCh
 		atomic.StoreInt32(&interrupted, 1)
-		fmt.Fprintf(os.Stderr, "\nInterrupted (%v) — stopping scans and writing partial results...\n", sig)
+		if s, ok := sig.(syscall.Signal); ok {
+			atomic.StoreInt32(&interruptSignal, int32(s))
+		}
+		logf("\nInterrupted (%v) — stopping scans and writing partial results...\n", sig)
 		cancelScan()
 	}()
 
@@ -843,9 +861,9 @@ func main() {
 	}
 
 	callerAccountId := aws.ToString(identity.Account)
-	fmt.Printf("Datafy Discovery Tool v%s\n", version)
-	fmt.Printf("Running as:         %s\n", aws.ToString(identity.Arn))
-	fmt.Printf("Management account: %s\n", callerAccountId)
+	logf("Datafy Discovery Tool v%s\n", version)
+	logf("Running as:         %s\n", aws.ToString(identity.Arn))
+	logf("Management account: %s\n", callerAccountId)
 
 	roleName := *roleFlag
 	if *setupRoleFlag {
@@ -862,7 +880,7 @@ func main() {
 		fmt.Fprintf(os.Stderr, "Failed to list accounts: %v\n", err)
 		os.Exit(1)
 	}
-	fmt.Printf("\nAccounts to scan: %d\n", len(accounts))
+	logf("\nAccounts to scan: %d\n", len(accounts))
 
 	outputFile := *outputFlag
 	if outputFile == "" {
@@ -923,7 +941,7 @@ func main() {
 					regionsFailed++
 				}
 			}
-			fmt.Printf("  [%d/%d] %s — %d regions\n", done, len(accounts), acct, len(records))
+			logf("  [%d/%d] %s — %d regions\n", done, len(accounts), acct, len(records))
 		}(acct)
 	}
 	wg.Wait()
@@ -943,18 +961,22 @@ func main() {
 	}
 	_ = enc.Encode(summary)
 
-	fmt.Printf("\nAccounts: %d total, %d scanned, %d skipped, %d failed\n",
+	logf("\nAccounts: %d total, %d scanned, %d skipped, %d failed\n",
 		summary.AccountsTotal, summary.AccountsScanned, summary.AccountsSkipped, summary.AccountsFailed)
-	fmt.Printf("Regions:  %d scanned, %d partial, %d failed\n",
+	logf("Regions:  %d scanned, %d partial, %d failed\n",
 		summary.RegionsScanned, summary.RegionsPartial, summary.RegionsFailed)
-	fmt.Printf("Output:   %s\n", outputFile)
+	logf("Output:   %s\n", outputFile)
 	if summary.Interrupted {
-		fmt.Printf("\nRun was interrupted — the results above are partial.\n")
+		logf("\nRun was interrupted — the results above are partial.\n")
 		_ = f.Close()
-		os.Exit(143)
+		sig := int(atomic.LoadInt32(&interruptSignal))
+		if sig == 0 {
+			sig = int(syscall.SIGTERM)
+		}
+		os.Exit(128 + sig)
 	}
 	if accountsSkipped+accountsFailed+regionsPartial+regionsFailed > 0 {
-		fmt.Printf("\nSome accounts or regions were not fully scanned. Every one is recorded in\n")
-		fmt.Printf("%s with a status and a reason — send the file as-is.\n", outputFile)
+		logf("\nSome accounts or regions were not fully scanned. Every one is recorded in\n")
+		logf("%s with a status and a reason — send the file as-is.\n", outputFile)
 	}
 }
