@@ -58,7 +58,7 @@ JSON
 
 # ── Fake AWS ───────────────────────────────────────────────────────────────────
 echo "Starting fake AWS endpoint..."
-FAKE_AWS_SCENARIO="$WORK/scenario.json" python3 "$HERE/fake_aws.py" > "$WORK/port.txt" 2>"$WORK/server.log" &
+FAKE_AWS_SCENARIO="$WORK/scenario.json" python3 "$ROOT/test/lib/fake_aws.py" > "$WORK/port.txt" 2>"$WORK/server.log" &
 SERVER_PID=$!
 
 PORT=""

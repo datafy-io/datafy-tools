@@ -1,29 +1,28 @@
 # DT-11095 — a payload that arrives damaged must not read as an empty region.
 #
-# This is the same bug class as the original ticket, one layer further down.
-# fetch_json only inspects the exit status, so a call that exits 0 with a
-# truncated body (a cut connection, a proxy error page, a short read) is treated
-# as success. The transform then fails and falls back to "[]" — and if that
-# fallback is silent, the region is reported as status=ok holding no volumes.
-# Indistinguishable from a genuinely empty region, which is precisely what the
+# This is the same bug class as the original ticket, one layer further down. A
+# call that returns a 200 with a truncated body — a cut connection, a proxy
+# error page, a short read — is a success as far as the transport is concerned.
+# If the implementation then falls back to an empty array without recording
+# anything, the region is reported as status=ok holding no volumes:
+# indistinguishable from a genuinely empty region, which is precisely what the
 # customer could not tell apart.
 #
-# us-east-1 returns truncated JSON for DescribeVolumes; eu-west-1 is healthy.
+# us-east-1 returns truncated XML for DescribeVolumes; eu-west-1 is healthy.
 
 setup_sandbox
 
-export MOCK_CALLER_ACCOUNT="000000000000"
-export MOCK_ACCOUNTS="000000000000"
-export MOCK_REGIONS="us-east-1,eu-west-1"
-export MOCK_VOLUMES=5
-export MOCK_INSTANCES=2
-export MOCK_SNAPSHOTS=2
-export MOCK_CORRUPT_OPS="describe-volumes"
-export MOCK_CORRUPT_REGIONS="us-east-1"
+scenario <<'JSON'
+{ "caller_account": "000000000000",
+  "accounts": ["000000000000"],
+  "regions":  ["us-east-1", "eu-west-1"],
+  "volumes": 5, "instances": 2, "snapshots": 2,
+  "corrupt": { "us-east-1": ["DescribeVolumes"] } }
+JSON
 
 run_discovery
 
-assert_equals 0 "$DISCOVERY_STATUS" "discovery.sh exits 0"
+assert_equals 0 "$DISCOVERY_STATUS" "exits 0"
 assert_valid_jsonl "a corrupt upstream payload still yields valid JSONL"
 
 corrupt=$(record_for 000000000000 us-east-1)
@@ -39,6 +38,9 @@ assert_equals "partial" "$(echo "$corrupt" | jq -r '.status')" \
 assert_not_empty "$(echo "$corrupt" | jq -r '.errors[]? | select(test("[Vv]olume"))')" \
   "the error identifies the payload that could not be parsed"
 
+assert_equals 0 "$(echo "$corrupt" | jq -r '.volumes | length')" \
+  "the unparseable payload contributes no volumes"
+
 # The rest of the region must still be collected — one bad call is not a reason
 # to discard the instances and snapshots that arrived intact.
 assert_equals 2 "$(echo "$corrupt" | jq -r '.instances | length')" \
@@ -49,3 +51,7 @@ assert_equals 2 "$(echo "$corrupt" | jq -r '.snapshots | length')" \
 # And the healthy region is untouched.
 assert_equals "ok" "$(echo "$healthy" | jq -r '.status')" "the healthy region is still status=ok"
 assert_equals 5    "$(echo "$healthy" | jq -r '.volumes | length')" "the healthy region kept its volumes"
+
+# The summary must not describe this as a clean run.
+assert_equals 1 "$(summary_record | jq -r '.regions_partial')" \
+  "the summary counts the damaged region as partial"

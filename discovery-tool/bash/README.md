@@ -58,40 +58,40 @@ chmod +x discovery.sh
 
 ## Tests
 
-The bash implementation has a test suite that runs `discovery.sh` end to end
-against a mock AWS CLI — no AWS account or credentials needed:
+**Most of the coverage for this implementation lives in `test/` at the
+repository root**, not here. That suite runs every behavioural case against
+bash, Python and Go alike, driving the real AWS CLI against a fake AWS endpoint:
+
+```bash
+../test/run_tests.sh --impl bash        # every case, bash only
+../test/run_tests.sh --impl bash 01 04  # only cases matching these patterns
+../test/run_tests.sh                    # all three implementations
+```
+
+What lives here is the handful of checks that are properties of `discovery.sh`
+itself rather than of the records it produces, and so have no Python or Go
+counterpart:
 
 ```bash
 ./test/run_tests.sh          # all cases
-./test/run_tests.sh 01 04    # only cases matching these patterns
+./test/run_tests.sh 00       # only cases matching these patterns
 ```
-
-`test/lib/mock_aws.sh` is installed on `PATH` as `aws` and is driven entirely by
-`MOCK_*` environment variables (account list, region list, resource counts, and
-which calls should be denied), so a case can describe the org it needs — from a
-two-account smoke test to a region holding 4000 volumes.
-
-Cases live in `test/cases/`:
 
 | Case | Covers |
 |---|---|
-| `00_smoke` | A healthy small org produces the documented records |
-| `01_stress_large_region` | 4000 volumes — the `jq: Argument list too long` crash |
-| `02_stress_many_accounts` | 12 accounts × 4 regions — no lost or duplicated records |
-| `03_stress_many_amis` | 3000 distinct AMIs — the `describe-images` argv overflow |
-| `04_region_failure_vs_empty` | An empty region is distinguishable from a denied one |
-| `05_account_skipped_reported` | Unreachable accounts appear in the file, with a reason |
-| `06_summary_record` | Coverage is answerable from the output alone |
-| `07_interrupt_preserves_data` | A killed run keeps what it already collected |
-| `08_credential_expiry` | An expired session is reported, never shown as empty |
-| `09_concurrency_ceiling` | Peak parallel calls stay within the RAM-derived cap |
-| `10_corrupt_payload` | An unparseable response is reported, not read as empty |
-| `11_pagination_not_capped` | Nothing disables or caps AWS CLI pagination |
-| `12_write_failures` | An unwritable output or temp dir fails loudly |
+| `00_pagination_flags` | Nothing disables or caps AWS CLI pagination |
+| `01_tmpdir_failure` | An unwritable `$TMPDIR` fails loudly, and names the variable to change |
 
-For cross-implementation coverage see `test/parity/` in the repository root,
-which runs bash, Python and Go against a shared fake AWS endpoint and diffs
-their output.
+`--no-paginate`, `--max-items` and `--page-size` each make the CLI return a
+prefix of the data and exit 0, which looks exactly like a small account rather
+than a truncated scan. Python and Go have no equivalent — their paginators are
+types, not flags. `$TMPDIR` matters here because only the bash implementation
+stages its records through it, writing a file per region and per account and
+concatenating them at the end.
+
+`test/lib/mock_aws.sh` is installed on `PATH` as `aws` and is driven by `MOCK_*`
+environment variables (account list, region list, resource counts), so these
+cases need neither `python3` nor `go`.
 
 ## macOS note
 
