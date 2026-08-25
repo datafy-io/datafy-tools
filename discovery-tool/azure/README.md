@@ -6,6 +6,11 @@ Datafy engagement before installation.
 
 **Read-only. No writes, no mutations. Safe to run in production.**
 
+The one exception is [`--setup-role`](#--setup-role-letting-the-tool-grant-its-own-access),
+which is off by default. With it, the tool assigns itself the built-in **Reader**
+role for the duration of the scan and always removes it again. Nothing else in
+the tool writes anything, ever.
+
 This is the Azure edition. The [AWS edition](../README.md) lives alongside it and
 collects the equivalent data from an AWS Organization.
 
@@ -31,11 +36,15 @@ Two things about Azure change the shape of the tool, and both are visible in the
 output.
 
 **There is no role to assume.** AWS needs `sts:AssumeRole` into each member
-account, which is why the AWS edition has `--role` and `--setup-role` and a
-CloudFormation StackSet to provision one. Azure has none of that: a single
-identity holding **Reader** at the tenant root management group reads every
-subscription directly. So there is no role setup step, nothing is created in
-your tenant, and nothing has to be cleaned up afterwards.
+account, which is why the AWS edition has `--role` and a CloudFormation StackSet
+to provision one. Azure has none of that: a single identity holding **Reader** at
+the tenant root management group reads every subscription directly, so there is
+no `--role` here and no per-subscription bootstrapping.
+
+`--setup-role` still exists, and does the same job the StackSet does — grant the
+access, scan, always take it away again — but it is one PUT and one DELETE
+rather than N stack instances, because Azure RBAC inherits down the management
+group hierarchy.
 
 **A record is a subscription, not a region.** AWS's EC2 APIs are regional, so the
 AWS edition makes one set of calls per account × region and reports a status per
@@ -134,6 +143,47 @@ az role assignment create \
 > (`az rest --method post --url "/providers/Microsoft.Authorization/elevateAccess?api-version=2016-07-01"`),
 > or an existing User Access Administrator at that scope.
 
+### `--setup-role`: letting the tool grant its own access
+
+If you would rather not set anything up in advance, `--setup-role` does it for
+you. It assigns Reader to the signed-in identity at the tenant root management
+group (or at `--management-group`), **waits for the assignment to take effect**,
+scans, and then always removes it — including when the scan fails, is
+interrupted, or cannot write its output file.
+
+```bash
+python3 discovery.py --setup-role
+```
+
+This is the counterpart of the AWS edition's `--setup-role` StackSet, and the
+only part of the tool that writes anything.
+
+| | Without the flag (default) | With `--setup-role` |
+|---|---|---|
+| Writes to your tenant | Nothing, ever | One role assignment, removed afterwards |
+| Permission needed | Reader, granted beforehand | Owner, User Access Administrator, or Role Based Access Control Administrator |
+| Coverage | Whatever the identity can already see | Every subscription in the tenant |
+
+Details worth knowing:
+
+- **The wait is not optional.** Azure does not make a role assignment effective
+  the moment it is written. Scanning immediately would miss precisely the
+  subscriptions the flag was used to reach — a failure that looks exactly like
+  the flag not working, right after it did. The tool polls until the new access
+  is usable, reporting progress, and gives up after `AZURE_PROPAGATION_TIMEOUT`
+  (default 300s) rather than hanging. Subscriptions still out of reach at that
+  point are recorded the ordinary way, with a reason.
+- **A standing grant is never revoked.** If Reader is already assigned, the tool
+  says so, leaves it alone, and does not remove it at the end. Only assignments
+  this run created are torn down.
+- **Cleanup runs on every exit path.** If it somehow cannot, the tool prints the
+  exact `az role assignment delete` command to run.
+- **Granting at a tenant root management group** additionally requires the Global
+  Administrator to have elevated access at least once
+  (`az rest --method post --url "/providers/Microsoft.Authorization/elevateAccess?api-version=2016-07-01"`).
+  If that has not happened, `--setup-role` fails with a message saying so, and
+  the scan can be re-run without the flag.
+
 ### Or per subscription
 
 If tenant-wide Reader is more than you want to grant, assign it per
@@ -181,6 +231,7 @@ these flags to narrow it:
 | `--management-group ID` | Limit to subscriptions beneath a management group, nested ones included |
 | `--include IDS` | Scan only these subscription IDs (comma-separated) |
 | `--exclude IDS` | Skip these subscription IDs (comma-separated) |
+| `--setup-role` | Grant Reader for the duration of the scan, then remove it |
 
 An `--include` id the identity cannot see is called out in a warning rather than
 quietly producing a shorter run.
@@ -236,6 +287,8 @@ is reported as an error against the subscription, never as an empty result.
 ## All flags
 
 ```
+--setup-role             Assign Reader to the signed-in identity for the duration
+                         of the scan; always removed afterwards
 --tenant           ID    Limit to subscriptions in this Entra tenant
 --management-group ID    Limit to subscriptions beneath this management group
 --include          IDS   Comma-separated subscription IDs to scan
@@ -243,6 +296,46 @@ is reported as an error against the subscription, never as an empty result.
 --output           FILE  Output file (default: discovery_azure_<timestamp>.json)
 --version                Print version and exit
 ```
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `AZURE_PROPAGATION_TIMEOUT` | `300` | With `--setup-role`, how long to wait for the assignment to take effect, in seconds |
+| `AZURE_PROPAGATION_POLL` | `10` | How often to re-check, in seconds |
+
+## Knowing what you did *not* scan
+
+This is the part of the Azure edition that differs most from AWS, and it is
+worth understanding before reading a result.
+
+`GET /subscriptions` returns **only the subscriptions the identity can already
+see**. A subscription that no role assignment reaches is not listed as denied —
+it is simply absent. AWS has no equivalent problem: `organizations:ListAccounts`
+names every account in the org whether or not it can be assumed into, so the
+denominator is free.
+
+Left alone, that means a tenant of two hundred subscriptions with Reader on
+three would report *"3 total, 3 scanned, 0 failed"* — byte-for-byte what a
+healthy three-subscription tenant reports.
+
+So the tool does not trust that call as its denominator. It asks the management
+group hierarchy what the tenant actually contains, because that lists
+subscriptions by membership rather than by access:
+
+- Anything in the hierarchy that `/subscriptions` did not return is written to
+  the file as a `failed` subscription, with a reason naming the missing role
+  assignment. It counts towards `subscriptions_total`.
+- If the hierarchy cannot be read either, no denominator exists and the run
+  genuinely cannot vouch for its own completeness. It says so — loudly on
+  stderr, and in the summary record as `scope_verified: false` with a
+  `scope_note` explaining why.
+
+```bash
+# Can these totals be read as full tenant coverage?
+tail -1 discovery_azure_*.json | jq '{scope_verified, scope_note, subscriptions_total}'
+```
+
+`--setup-role` sidesteps the whole problem: assigning Reader at the tenant root
+makes every subscription visible before the scan starts.
 
 ## Output format
 
@@ -306,6 +399,8 @@ answerable from the shared file alone:
   "cloud": "azure",
   "scanned_at": "2026-08-25T14:35:00Z",
   "interrupted": false,
+  "scope_verified": true,
+  "scope_note": "scope checked against the tenant root management group",
   "subscriptions_total": 140,
   "subscriptions_scanned": 132,
   "subscriptions_partial": 3,
@@ -316,6 +411,11 @@ answerable from the shared file alone:
 
 The four status counts partition the total, so nothing is counted twice and
 nothing goes missing between them.
+
+`scope_verified` says whether that total can be trusted as the whole tenant —
+see [Knowing what you did *not* scan](#knowing-what-you-did-not-scan). When it
+is `false`, the totals describe what this identity could see, which may be less
+than the tenant contains.
 
 `interrupted` is `true` when the run was stopped by Ctrl+C, a timeout or a
 supervisor. The tool writes out everything it had already collected and exits
@@ -388,6 +488,10 @@ testable would mean testing a tool nobody runs.
 | `12_concurrency_ceiling` | Peak parallelism stays within the documented cap |
 | `13_power_state` | Run state comes from the `statusOnly` pass, and losing it costs one field rather than the fleet |
 | `14_stress_large_subscription` | 4000 disks in one subscription arrive whole |
+| `15_partial_grant` | A half-granted tenant cannot pass itself off as a fully-scanned one |
+| `16_scope_unverifiable` | With no denominator available, the file says so rather than implying coverage |
+| `17_setup_role` | `--setup-role` grants, scans, and always cleans up — including when the run fails |
+| `18_setup_role_propagation` | The scan waits for RBAC to propagate, and bounds that wait |
 
 ### Requirements
 

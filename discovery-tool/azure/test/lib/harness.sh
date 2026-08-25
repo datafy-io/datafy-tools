@@ -93,7 +93,24 @@ start_fake() {
   # The token the tool signs with. Set explicitly so the suite never reaches for
   # a real credential — an az-cli login on the machine running the tests must
   # not change what the tests do.
-  export AZURE_ACCESS_TOKEN="fake-test-token"
+  #
+  # Shaped as a real JWT, because --setup-role reads the principal to grant
+  # Reader to out of the token's `oid` claim: an opaque placeholder would leave
+  # that path untested. Unsigned, since nothing here verifies it.
+  TEST_PRINCIPAL_ID="99999999-9999-9999-9999-999999999999"
+  export TEST_PRINCIPAL_ID
+  AZURE_ACCESS_TOKEN="$("$PYTHON_BIN" - "$TEST_PRINCIPAL_ID" <<'PY'
+import base64, json, sys
+def seg(d):
+    return base64.urlsafe_b64encode(json.dumps(d).encode()).rstrip(b"=").decode()
+print(".".join([
+    seg({"alg": "none", "typ": "JWT"}),
+    seg({"oid": sys.argv[1], "tid": "11111111-1111-1111-1111-111111111111"}),
+    "not-a-real-signature",
+]))
+PY
+)"
+  export AZURE_ACCESS_TOKEN
   # How requests learns to trust the fake's self-signed certificate.
   export REQUESTS_CA_BUNDLE="$CERT_DIR/cert.pem"
   # Keep the backoff short: cases that exercise retries should not spend the

@@ -27,7 +27,15 @@ Scenario keys, all optional:
   corrupt             ["Microsoft.Compute/snapshots"] — answer 200 with non-JSON
   reject_status_only  true — deny the statusOnly=true pass, to exercise the
                       degradation where VMs are listed but run state is not
-  management_groups   {"mg-id": ["sub-id", ...]}
+  invisible_subscriptions
+                      ids omitted from /subscriptions the way ARM omits
+                      subscriptions no role assignment reaches, while the
+                      management group hierarchy still lists them
+  deny_tenant_root    true — 403 the tenant root management group, so no
+                      denominator can be established at all
+  management_groups   {"mg-id": ["sub-id", ...]}. The tenant root group (named
+                      by tenant_id) is served automatically from every
+                      subscription unless overridden here.
   delay_ms            sleep this long before answering, to widen the race window
 """
 
@@ -85,8 +93,56 @@ def write_cert(directory):
 
 # ── Scenario helpers ───────────────────────────────────────────────────────────
 
+def all_subscriptions():
+    """Every subscription the scenario describes, visible or not."""
+    return SCENARIO.get("subscriptions") or ["00000000-0000-0000-0000-000000000001"]
+
+
+def invisible():
+    """Subscriptions no role assignment reaches, right now.
+
+    Real ARM does not return these from /subscriptions at all — it does not list
+    them as denied, it omits them. Modelling that is the whole point: a tool
+    that trusts /subscriptions as its denominator cannot tell a fully-granted
+    tenant from a half-granted one, and its output looks identical either way.
+
+    A grant at a management group scope makes its members visible from then on,
+    which is what --setup-role is for. Without that, a test could not tell the
+    flag working from the flag doing nothing.
+    """
+    hidden = set(SCENARIO.get("invisible_subscriptions") or [])
+    if not hidden:
+        return hidden
+    with _lock:
+        scopes = set(GRANTED_SCOPES)
+    for scope in scopes:
+        group = scope.rstrip("/").rsplit("/", 1)[-1]
+        hidden -= _group_members(group)
+    if SCENARIO.get("propagation_polls"):
+        # Model RBAC propagation lag: the grant is written, but the new access
+        # is not usable for the first few polls. A tool that scans the instant
+        # the PUT returns would miss exactly the subscriptions it just granted
+        # itself — and would look like the flag had failed, right after it
+        # worked.
+        with _lock:
+            PROPAGATION["polls"] += 1
+            if PROPAGATION["polls"] <= SCENARIO["propagation_polls"]:
+                return set(SCENARIO.get("invisible_subscriptions") or [])
+    return hidden
+
+
+def _group_members(group):
+    configured = SCENARIO.get("management_groups") or {}
+    if group in configured:
+        return set(configured[group])
+    if group == TENANT:
+        return {e if isinstance(e, str) else e["id"] for e in all_subscriptions()}
+    return set()
+
+
 def subscriptions():
-    raw = SCENARIO.get("subscriptions") or ["00000000-0000-0000-0000-000000000001"]
+    raw = [e for e in all_subscriptions()
+           if (e if isinstance(e, str) else e["id"]) not in invisible()]
     out = []
     for entry in raw:
         if isinstance(entry, str):
@@ -323,6 +379,12 @@ def make_policies(sub, rg, provider, vault, n):
 
 STATS = {"calls": 0, "peak_concurrent": 0, "throttled": 0, "pages": 0}
 BY_TYPE = {}
+# Role assignments this run created, by assignment name, and the scopes they
+# grant. A test asserts on both: that the scan was preceded by a grant, and that
+# the grant was gone by the end.
+ASSIGNMENTS = {}
+GRANTED_SCOPES = set()
+PROPAGATION = {"polls": 0}
 _inflight = 0
 _lock = threading.Lock()
 _throttle_seen = {}
@@ -414,13 +476,82 @@ class Handler(BaseHTTPRequestHandler):
             with _lock:
                 _inflight -= 1
 
+    # -- role assignments (--setup-role) ---------------------------------------
+
+    def do_PUT(self):
+        """Create a role assignment.
+
+        Grants are recorded, and a granted management group scope makes its
+        subscriptions visible to /subscriptions from then on — which is the
+        whole behaviour --setup-role exists to produce, and the only way a test
+        can tell it apart from the flag quietly doing nothing.
+        """
+        # Drain the request body before answering. These are keep-alive
+        # connections, so a body left unread stays in the socket buffer and gets
+        # parsed as the head of the *next* request on it — which shows up as an
+        # unrelated 400 on whatever call happens to follow.
+        self.rfile.read(int(self.headers.get("Content-Length") or 0))
+
+        path = urlparse(self.path).path
+        parts = [p for p in path.strip("/").split("/") if p]
+        if parts[-2:-1] != ["roleAssignments"]:
+            return self._error(404, "NotFound", f"no route for PUT {path}")
+
+        note_call("roleAssignments/write")
+        if SCENARIO.get("deny_role_write"):
+            return self._error(403, "AuthorizationFailed",
+                               "The client does not have authorization to perform action "
+                               "'Microsoft.Authorization/roleAssignments/write' over scope "
+                               f"{'/'.join(parts[:-2])}.")
+
+        name = parts[-1]
+        # Strip the four trailing segments the assignment id adds —
+        # providers/Microsoft.Authorization/roleAssignments/<name> — to get back
+        # to the scope it was made at.
+        scope = "/" + "/".join(parts[:-4])
+
+        if SCENARIO.get("role_already_exists"):
+            # A standing assignment. ARM refuses to create a duplicate, and the
+            # access it grants is already in effect — so the scope counts as
+            # granted, but nothing here is ours to remove afterwards.
+            with _lock:
+                GRANTED_SCOPES.add(scope)
+            return self._error(409, "RoleAssignmentExists",
+                               "The role assignment already exists.")
+
+        with _lock:
+            ASSIGNMENTS[name] = scope
+            GRANTED_SCOPES.add(scope)
+        self._send(201, {"id": path, "name": name,
+                         "properties": {"scope": scope}})
+
+    def do_DELETE(self):
+        path = urlparse(self.path).path
+        parts = [p for p in path.strip("/").split("/") if p]
+        if parts[-2:-1] != ["roleAssignments"]:
+            return self._error(404, "NotFound", f"no route for DELETE {path}")
+
+        note_call("roleAssignments/delete")
+        name = parts[-1]
+        with _lock:
+            scope = ASSIGNMENTS.pop(name, None)
+            GRANTED_SCOPES.discard(scope)
+        if scope is None:
+            # ARM answers 204 when there was nothing to remove.
+            self.send_response(204)
+            self.send_header("Content-Length", "0")
+            return self.end_headers()
+        self._send(200, {"id": path, "name": name})
+
     def _route(self):
         path = urlparse(self.path).path
         query = parse_qs(urlparse(self.path).query)
 
         if path == "/__stats":
             with _lock:
-                return self._send(200, {**STATS, "by_type": dict(BY_TYPE)})
+                return self._send(200, {**STATS, "by_type": dict(BY_TYPE),
+                                        "granted_scopes": sorted(GRANTED_SCOPES),
+                                        "assignments": len(ASSIGNMENTS)})
 
         if SCENARIO.get("delay_ms"):
             time.sleep(SCENARIO["delay_ms"] / 1000.0)
@@ -439,8 +570,20 @@ class Handler(BaseHTTPRequestHandler):
             note_call("descendants")
             try:
                 group = parts[3]
-                members = (SCENARIO.get("management_groups") or {}).get(group)
-                if members is None:
+                configured = SCENARIO.get("management_groups") or {}
+                if group in configured:
+                    members = configured[group]
+                elif group == TENANT and not SCENARIO.get("deny_tenant_root"):
+                    # The tenant root group lists membership, not access, so it
+                    # sees the invisible subscriptions too.
+                    members = [e if isinstance(e, str) else e["id"]
+                               for e in all_subscriptions()]
+                elif group == TENANT:
+                    return self._error(403, "AuthorizationFailed",
+                                       "The client does not have authorization to perform action "
+                                       "'Microsoft.Management/managementGroups/read' over scope "
+                                       f"/providers/Microsoft.Management/managementGroups/{group}.")
+                else:
                     return self._error(404, "NotFound", f"management group {group} not found")
                 return self._paged([{
                     "id": f"/providers/Microsoft.Management/managementGroups/{group}/subscriptions/{m}",

@@ -27,11 +27,14 @@ README.md for how to grant it.
 """
 
 import argparse
+import base64
 import json
 import os
 import signal
 import sys
 import threading
+import time
+import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from urllib.parse import urlparse
@@ -119,7 +122,23 @@ API = {
     "rsv_policies":      _api("rsv_policies",      "2023-02-01"),
     "dp_vaults":         _api("dp_vaults",         "2023-05-01"),
     "dp_policies":       _api("dp_policies",       "2023-05-01"),
+    "role_assignments":  _api("role_assignments",  "2022-04-01"),
 }
+
+# The built-in Reader role. This GUID is the same in every Azure cloud and
+# tenant — built-in role definition ids are global constants.
+READER_ROLE_ID = "acdd72a7-3385-48ef-bd42-f606fba81ae7"
+
+# A fixed namespace, so the assignment name for a given principal and scope is
+# always the same GUID. Re-running --setup-role after a crash then lands on the
+# assignment the previous run left behind instead of stacking up a second one.
+ASSIGNMENT_NAMESPACE = uuid.UUID("6f9d3a1e-0b6c-5f8a-9c2d-4e7b1a3f5c80")
+
+# Role assignments are not effective the instant they are written; ARM has to
+# propagate them. Scanning immediately would miss exactly the subscriptions
+# --setup-role was used to reach, and would look like it had worked.
+PROPAGATION_TIMEOUT = float(os.environ.get("AZURE_PROPAGATION_TIMEOUT") or 300)
+PROPAGATION_POLL    = float(os.environ.get("AZURE_PROPAGATION_POLL") or 10)
 
 
 # ── Utilities ──────────────────────────────────────────────────────────────────
@@ -295,6 +314,26 @@ def build_client(credential):
             HttpLoggingPolicy(),
         ],
     )
+
+
+def arm_put(client, path, api_version, body):
+    """One ARM PUT. Returns the decoded body, or raises ArmError."""
+    request = HttpRequest(
+        "PUT", f"{ARM_ENDPOINT}{path}",
+        params={"api-version": api_version},
+        json=body,
+    )
+    return _decode(client.send_request(request))
+
+
+def arm_delete(client, path, api_version):
+    """One ARM DELETE. A 204 means it was already gone, which is a success."""
+    request = HttpRequest("DELETE", f"{ARM_ENDPOINT}{path}",
+                          params={"api-version": api_version})
+    response = client.send_request(request)
+    if response.status_code == 204:
+        return None
+    return _decode(response)
 
 
 def arm_get(client, path, api_version, params=None):
@@ -851,14 +890,62 @@ def management_group_subscriptions(client, group_id):
     }
 
 
-def list_subscriptions(client, tenant, management_group, include, exclude):
-    """Every subscription to scan, narrowed by the scope flags.
+def _tenant_roots(subs, tenant, hint=None):
+    """Tenant ids whose hierarchy is worth asking about.
 
-    The tenant-wide list is always fetched, even when --include names the
-    subscriptions outright: it costs one call and it is where the display name
-    and the enabled/disabled state come from, both of which belong in the
-    output. If that call is the thing that failed and --include was given, the
-    ids alone are still enough to scan with.
+    The tenant root management group's id is the tenant id, so the tenants the
+    visible subscriptions belong to are the roots to check.
+
+    `hint` — the tenant from the access token — covers the case that matters
+    most and is easiest to miss: an identity that can see no subscriptions at
+    all has no tenant to derive from them, which is exactly when knowing what it
+    is missing is worth the most.
+    """
+    if tenant:
+        return [tenant]
+    roots = sorted({s["tenant_id"] for s in subs if s["tenant_id"]})
+    if not roots and hint:
+        return [hint]
+    return roots
+
+
+def token_tenant_hint(credential):
+    """The tenant id from the access token, or None.
+
+    Best effort, and never fatal: it is used only to know which tenant root
+    management group to ask about when the subscription list cannot name one.
+    A scan works without it — it just cannot vouch for its own scope.
+    """
+    try:
+        return _token_claims(credential.get_token(ARM_SCOPE).token).get("tid")
+    except Exception:                                # noqa: BLE001
+        return None
+
+
+def list_subscriptions(client, tenant, management_group, include, exclude,
+                       tenant_hint=None):
+    """What to scan, what is known to be missing, and whether that is knowable.
+
+    Returns (scannable, unreachable, scope).
+
+    The hard part in Azure is the denominator. `GET /subscriptions` returns only
+    the subscriptions the identity can already see — a subscription no role
+    assignment reaches is not listed as denied, it is simply absent. So unlike
+    AWS, where organizations:ListAccounts names every account in the org whether
+    or not it can be assumed into, this call cannot on its own tell a complete
+    scan from a half-granted one. Left alone it would report
+    "3 total, 3 scanned, 0 failed" for a tenant of two hundred.
+
+    The management group hierarchy is the denominator, because it lists
+    subscriptions by membership rather than by access. Anything in it that
+    `/subscriptions` did not return is a subscription this identity cannot
+    reach, and is returned in `unreachable` so it lands in the output file with
+    a reason rather than vanishing.
+
+    When the hierarchy cannot be read either, no denominator is available and
+    the run genuinely cannot vouch for its own completeness. That is reported as
+    `scope.verified = False` and carried into the summary record, so the file
+    says so rather than implying coverage it never established.
     """
     try:
         subs = [_normalize_subscription(s)
@@ -874,22 +961,247 @@ def list_subscriptions(client, tenant, management_group, include, exclude):
     if tenant:
         subs = [s for s in subs if not s["tenant_id"] or s["tenant_id"] == tenant]
 
+    visible     = {s["subscription_id"] for s in subs}
+    unreachable = []
+    scope       = {"verified": False, "note": None}
+
     if management_group:
+        # The group is the scope, so it is also the denominator.
         in_group = management_group_subscriptions(client, management_group)
         subs = [s for s in subs if s["subscription_id"] in in_group]
+        for missing in sorted(in_group - visible):
+            unreachable.append((missing, (
+                f"in management group {management_group}, but not visible to this "
+                "identity — no role assignment reaches it")))
+        scope = {"verified": True,
+                 "note": f"scope checked against management group {management_group}"}
+
+    elif include:
+        # An explicit list is its own denominator: the operator said what they
+        # expected, so anything they named and we cannot see is a gap.
+        scope = {"verified": True, "note": "scope checked against --include"}
+
+    else:
+        # Whole-tenant run. Ask the tenant root management group what exists.
+        expected, failures, checked = set(), [], []
+        for root in _tenant_roots(subs, tenant, tenant_hint):
+            try:
+                expected |= management_group_subscriptions(client, root)
+                checked.append(root)
+            except Exception as e:                   # noqa: BLE001
+                failures.append(f"tenant {root}: {condense(e)}")
+
+        for missing in sorted(expected - visible):
+            unreachable.append((missing, (
+                "in the tenant hierarchy, but not visible to this identity — "
+                "no role assignment reaches it")))
+
+        if checked and not failures:
+            scope = {"verified": True,
+                     "note": "scope checked against the tenant root management group"}
+        else:
+            detail = "; ".join(failures) or "no tenant could be determined from the subscription list"
+            scope = {"verified": False, "note": (
+                "scope NOT checked against the tenant root management group "
+                f"({detail}). Subscriptions this identity cannot see are absent from "
+                "this file and are not counted below — do not read these totals as "
+                "full tenant coverage.")}
 
     if include:
         wanted = set(include)
-        known  = {s["subscription_id"] for s in subs}
         subs = [s for s in subs if s["subscription_id"] in wanted]
-        # An id that was asked for and is not there is a scoping mistake worth
-        # saying out loud, rather than a quietly shorter run.
-        for missing in sorted(wanted - known):
-            log(f"  [warn] --include names {missing}, which this identity cannot see")
+        already = {sub_id for sub_id, _ in unreachable}
+        # Named and not visible. Recorded, not merely warned about: a warning on
+        # stderr is gone the moment the operator redirects it, and the file is
+        # the only thing that gets sent to us.
+        for missing in sorted(wanted - visible - already):
+            unreachable.append((missing, (
+                "named by --include, but not visible to this identity — "
+                "no role assignment reaches it")))
 
-    subs = [s for s in subs if s["subscription_id"] not in exclude]
+    subs        = [s for s in subs if s["subscription_id"] not in exclude]
+    unreachable = [(i, r) for i, r in unreachable if i not in exclude]
     subs.sort(key=lambda s: s["subscription_id"] or "")
-    return subs
+    unreachable.sort()
+    return subs, unreachable, scope
+
+
+# ── Reader access setup (--setup-role) ────────────────────────────────────────
+# The Azure counterpart of the AWS edition's CloudFormation StackSet. Same
+# contract: grant the access the scan needs, scan, then always take it away
+# again — including when the scan fails.
+#
+# It is a far smaller thing than the AWS one, because Azure RBAC inherits. AWS
+# has to deploy a role into every member account and tear N of them down again;
+# here a single assignment at a tenant root management group covers every
+# subscription beneath it, present and future. One PUT, one DELETE.
+#
+# This is also the only part of the tool that writes anything.
+
+
+def _token_claims(token):
+    """The claims inside a JWT, without verifying it.
+
+    Only ever used to read our own access token's `oid` — the object id of the
+    principal ARM will be granting the role to. The token was just handed to us
+    by our own credential and is about to be sent back to the issuer, which does
+    verify it. Nothing here is a trust decision.
+    """
+    try:
+        payload = token.split(".")[1]
+        payload += "=" * (-len(payload) % 4)
+        return json.loads(base64.urlsafe_b64decode(payload))
+    except Exception as e:                           # noqa: BLE001
+        raise RuntimeError(f"could not read the access token's claims: {condense(e)}")
+
+
+def token_identity(credential):
+    """The (principal object id, tenant id) this tool is running as.
+
+    Both are read from the access token rather than from Microsoft Graph, which
+    would mean another dependency, another consent prompt and another permission
+    to document — for two values the token already carries.
+
+    The tenant has to come from here rather than from the subscription list,
+    which is the trap: an identity with no role assignments anywhere sees an
+    empty /subscriptions, so deriving the tenant from it fails in exactly the
+    situation --setup-role exists to fix.
+    """
+    claims = _token_claims(credential.get_token(ARM_SCOPE).token)
+    oid = claims.get("oid")
+    if not oid:
+        raise RuntimeError(
+            "the access token carries no 'oid' claim, so the identity to grant "
+            "Reader to cannot be determined. Sign in as a user or service "
+            "principal, or grant Reader yourself and run without --setup-role.")
+    return oid, claims.get("tid")
+
+
+def _assignment_path(scope, name):
+    return f"{scope}/providers/Microsoft.Authorization/roleAssignments/{name}"
+
+
+def grant_reader(client, scope, principal):
+    """Assign Reader to `principal` at `scope`.
+
+    Returns True if this call created the assignment, False if an equivalent one
+    was already there. The distinction is load-bearing: teardown removes only
+    what this run created, so a standing grant that happens to match is never
+    revoked out from under the customer. (The AWS edition is less careful here —
+    it deletes the StackSet even when it reused a pre-existing one.)
+    """
+    name = str(uuid.uuid5(ASSIGNMENT_NAMESPACE, f"{scope}|{principal}"))
+    body = {"properties": {
+        "roleDefinitionId": f"/providers/Microsoft.Authorization/roleDefinitions/{READER_ROLE_ID}",
+        "principalId":      principal,
+    }}
+    try:
+        arm_put(client, _assignment_path(scope, name), API["role_assignments"], body)
+        return True
+    except ArmError as e:
+        if e.code in ("RoleAssignmentExists", "RoleAssignmentUpdateNotPermitted"):
+            log(f"  Reader is already assigned at {scope} — leaving it alone.")
+            return False
+        raise
+
+
+def revoke_reader(client, scope, principal):
+    name = str(uuid.uuid5(ASSIGNMENT_NAMESPACE, f"{scope}|{principal}"))
+    arm_delete(client, _assignment_path(scope, name), API["role_assignments"])
+
+
+def wait_for_propagation(client, expected):
+    """Block until the new access is actually usable, or the timeout expires.
+
+    Azure does not make a role assignment effective the moment it is written.
+    Scanning straight away would miss precisely the subscriptions --setup-role
+    was used to reach, and would report them unreachable — a failure that looks
+    exactly like the flag not working, immediately after it did.
+
+    `expected` is what the management group hierarchy says should become
+    visible. Polling stops as soon as /subscriptions has caught up with it.
+    """
+    if not expected:
+        return True
+    deadline = time.time() + PROPAGATION_TIMEOUT
+    while True:
+        try:
+            visible = {s.get("subscriptionId")
+                       for s in arm_list(client, "/subscriptions", API["subscriptions"])}
+        except Exception as e:                       # noqa: BLE001
+            visible = set()
+            log(f"  [warn] could not re-check visible subscriptions: {condense(e)}")
+
+        missing = expected - visible
+        if not missing:
+            log(f"  Reader is in effect across {len(expected)} subscription(s).")
+            return True
+        if time.time() >= deadline:
+            log(f"  [warn] {len(missing)} subscription(s) still not visible after "
+                f"{PROPAGATION_TIMEOUT:.0f}s. Scanning anyway — every one of them is "
+                "recorded in the output with a reason.")
+            return False
+        log("  Waiting for the role assignment to take effect "
+            f"({len(expected) - len(missing)}/{len(expected)} visible)...")
+        time.sleep(PROPAGATION_POLL)
+
+
+def setup_reader_access(client, credential, tenant, management_group):
+    """Grant Reader everywhere this run needs it. Returns what to revoke later.
+
+    The scope is always a management group, never a subscription, and that is
+    the point: assigning at a tenant root covers every subscription beneath it,
+    so a subscription the identity could not previously see becomes readable
+    without having to be enumerated first. It could not have been enumerated —
+    a subscription no assignment reaches is absent from /subscriptions entirely.
+    """
+    principal, token_tenant = token_identity(credential)
+    log(f"Granting Reader to principal {principal}...")
+
+    if management_group:
+        groups = [management_group]
+    else:
+        # --tenant first if given, then the token's own tenant. Deliberately not
+        # the subscription list: an identity with no assignments anywhere sees
+        # nothing there, and that is the case this flag is for.
+        groups = [g for g in (tenant, token_tenant) if g][:1]
+        if not groups:
+            raise RuntimeError(
+                "no tenant could be determined to grant Reader in — the access token "
+                "carries no 'tid' claim. Pass --tenant, or --management-group, to name "
+                "the scope explicitly.")
+
+    granted, expected = [], set()
+    for group in groups:
+        scope = f"/providers/Microsoft.Management/managementGroups/{group}"
+        if grant_reader(client, scope, principal):
+            granted.append((scope, principal))
+            log(f"  Reader assigned at {scope}")
+        try:
+            expected |= management_group_subscriptions(client, group)
+        except Exception as e:                       # noqa: BLE001
+            log(f"  [warn] could not read the hierarchy under {scope}: {condense(e)}")
+
+    if granted:
+        wait_for_propagation(client, expected)
+    return granted
+
+
+def teardown_reader_access(client, granted):
+    """Remove every assignment this run created. Never raises.
+
+    Called from a finally block, so it has to survive whatever went wrong
+    upstream — and a failure to clean up has to be shouted about rather than
+    raised, since raising here would replace the real error with this one.
+    """
+    for scope, principal in granted:
+        try:
+            revoke_reader(client, scope, principal)
+            log(f"Reader assignment removed from {scope}")
+        except Exception as e:                       # noqa: BLE001
+            log(f"  [warn] could not remove the Reader assignment at {scope}: {condense(e)}")
+            log(f"  Remove it by hand: az role assignment delete --assignee {principal} "
+                f"--role Reader --scope {scope}")
 
 
 # ── Entry point ────────────────────────────────────────────────────────────────
@@ -899,13 +1211,24 @@ def parse_args():
         description=(
             f"Datafy Discovery Tool (Azure) v{VERSION} — inventories managed disks, virtual "
             "machines, snapshots, images and backup policies across an Azure tenant. "
-            "Read-only. Safe to run in production."
+            "Read-only, unless --setup-role is used. Safe to run in production."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
     parser.add_argument("--version", action="version",
                         version=f"Datafy Discovery Tool (Azure) v{VERSION}")
+    parser.add_argument(
+        "--setup-role", action="store_true",
+        help=(
+            "Assign the built-in Reader role to the signed-in identity at the tenant "
+            "root management group (or at --management-group), wait for it to take "
+            "effect, scan, then always remove it again. Requires permission to create "
+            "role assignments — Owner, User Access Administrator or Role Based Access "
+            "Control Administrator. Without this flag the tool writes nothing and scans "
+            "with whatever access the identity already has."
+        ),
+    )
     parser.add_argument("--tenant", metavar="TENANT_ID",
                         help="Limit to subscriptions in this Microsoft Entra tenant")
     parser.add_argument("--management-group", metavar="MG_ID",
@@ -945,8 +1268,45 @@ def main():
     credential = build_credential(args.tenant)
     client     = build_client(credential)
 
+    # --setup-role is the only path in this tool that writes anything. Whatever
+    # happens afterwards — a failed scan, an interrupt, an unwritable --output —
+    # the assignment it created has to come back off, so the scan runs inside a
+    # try/finally exactly the way the AWS edition's StackSet does. sys.exit
+    # raises SystemExit, which a finally still runs on, so even the early exits
+    # clean up after themselves.
+    granted = []
     try:
-        subscriptions = list_subscriptions(client, args.tenant, args.management_group, include, exclude)
+        if args.setup_role:
+            try:
+                granted = setup_reader_access(
+                    client, credential, args.tenant, args.management_group)
+            except Exception as e:                   # noqa: BLE001
+                print(
+                    f"Error: --setup-role could not grant Reader — {condense(e)}\n\n"
+                    "Creating a role assignment needs Owner, User Access Administrator or\n"
+                    "Role Based Access Control Administrator at the scope. Assigning at a\n"
+                    "tenant root management group additionally needs the Global Administrator\n"
+                    "to have elevated access at least once — see README.md, 'Permissions'.\n\n"
+                    "Run without --setup-role to scan with the access you already have.",
+                    file=sys.stderr)
+                sys.exit(1)
+        run_scan(client, args, include, exclude, interrupt_signal,
+                 token_tenant_hint(credential))
+    finally:
+        teardown_reader_access(client, granted)
+
+
+def run_scan(client, args, include, exclude, interrupt_signal, tenant_hint=None):
+    """Enumerate, scan and write the output file.
+
+    Assumes whatever access the run is going to get is already in place, so that
+    granting it and using it stay separable — and so that the ordinary,
+    write-nothing path is the same code as the --setup-role one.
+    """
+    try:
+        subscriptions, unreachable, scope = list_subscriptions(
+            client, args.tenant, args.management_group, include, exclude,
+            tenant_hint)
     except ClientAuthenticationError as e:
         print(
             f"Error: could not authenticate to Azure — {condense(e)}\n\n"
@@ -983,6 +1343,16 @@ def main():
     log(f"\nSubscriptions to scan: {len(scannable)}")
     if disabled:
         log(f"Subscriptions not enabled, recorded as skipped: {len(disabled)}")
+    if unreachable:
+        log(f"Subscriptions this identity cannot read, recorded as failed: {len(unreachable)}")
+        for sub_id, reason in unreachable:
+            log(f"  [gap] {sub_id}: {reason}")
+        log("  Grant Reader at the tenant root management group to cover them — "
+            "see README.md, 'Permissions'.")
+    if not scope["verified"]:
+        # Loud, because it is the one thing that cannot be recovered from the
+        # file afterwards: what is absent is absent without trace.
+        log(f"\n  [warn] {scope['note']}")
 
     output_file = args.output or f"discovery_azure_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
 
@@ -1010,6 +1380,16 @@ def main():
             emit(subscription_record(
                 sub, "skipped",
                 f"subscription state is {sub['state']!r}, not 'Enabled'"))
+
+        # Subscriptions the hierarchy says exist but this identity cannot read.
+        # Recorded rather than dropped: an unreachable subscription that leaves
+        # no trace in the file is the one failure the customer cannot see and we
+        # cannot ask about.
+        for sub_id, reason in unreachable:
+            emit(subscription_record(
+                {"subscription_id": sub_id, "display_name": None,
+                 "state": None, "tenant_id": args.tenant},
+                "failed", reason))
 
         # Records are written as each subscription completes, so an interrupted
         # run keeps everything already collected — a large tenant can easily be
@@ -1062,7 +1442,11 @@ def main():
             "cloud":                   "azure",
             "scanned_at":              now_utc(),
             "interrupted":             interrupted,
-            "subscriptions_total":     len(subscriptions),
+            # False when the run could not establish what the tenant contains,
+            # so the totals below are "what was visible", not "what exists".
+            "scope_verified":          scope["verified"],
+            "scope_note":              scope["note"],
+            "subscriptions_total":     len(subscriptions) + len(unreachable),
             "subscriptions_scanned":   tally["ok"],
             "subscriptions_partial":   tally["partial"],
             "subscriptions_failed":    tally["failed"],
@@ -1082,6 +1466,10 @@ def main():
                                 "subscriptions_skipped")):
         log("\nSome subscriptions were not fully scanned. Every one is recorded in")
         log(f"{output_file} with a status and a reason — send the file as-is.")
+    if not scope["verified"]:
+        log("\nCoverage could not be verified: the totals above count only what this")
+        log("identity can see, which may be less than the tenant contains. The summary")
+        log("record carries scope_verified=false so the file says so too.")
 
     # Conventional 128+signal, matching the AWS edition, so a wrapper can tell
     # an interrupted run from a complete one. The results written above are
