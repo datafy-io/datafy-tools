@@ -679,28 +679,50 @@ def scan_subscription(client, sub):
                       "Microsoft.Compute/virtualMachineScaleSets", "scale_sets", shape_scale_set)
 
     def list_vms():
-        """VMs, with the instance view when ARM will give it.
+        """VMs, with run-time power state merged in from a second pass.
 
-        power_state comes only from the instance view, and a stopped VM still
-        paying for its disks is precisely what a scoping run is looking for — so
-        the expand is worth asking for. If a provider version rejects it the
-        call is retried plain: losing power_state is a far smaller loss than
-        losing the VM list, and the retry is recorded, so the subscription is
-        reported partial rather than passing itself off as complete.
+        power_state lives in the instance view, and a stopped VM still paying
+        for its disks is precisely what a scoping run is looking for. ARM will
+        not expand it inline at subscription scope, though — `$expand=
+        instanceView` there is rejected outright ("Expand Instance View is only
+        supported when Virtual Machine Scale Set resource filter is applied"),
+        because the expand is only honoured for a scale-set-filtered query. The
+        supported route for a whole subscription is a separate pass with
+        statusOnly=true, which returns each VM's instance view and nothing else.
+
+        So the inventory call goes out plain, and first: it is the one that must
+        not be lost. If the status pass then fails, every VM is still reported
+        with power_state null, and the subscription is marked partial with the
+        reason — losing run state is a far smaller loss than losing the fleet.
+
+        Only `id` and the instance view are read back from the status pass. It
+        is documented to return run-time status rather than a second full copy
+        of each VM, so nothing here depends on the rest of that payload.
         """
         path = f"{base}/Microsoft.Compute/virtualMachines"
-        raw = attempt(
-            "Microsoft.Compute/virtualMachines?$expand=instanceView",
-            lambda: arm_list(client, path, API["virtual_machines"], {"$expand": "instanceView"}),
-            None,
+        vms = [shape_vm(v) for v in attempt(
+            "Microsoft.Compute/virtualMachines",
+            lambda: arm_list(client, path, API["virtual_machines"]),
+            [],
+        )]
+        if not vms:
+            return vms
+
+        statuses = attempt(
+            "Microsoft.Compute/virtualMachines?statusOnly=true",
+            lambda: arm_list(client, path, API["virtual_machines"], {"statusOnly": "true"}),
+            [],
         )
-        if raw is None:
-            raw = attempt(
-                "Microsoft.Compute/virtualMachines",
-                lambda: arm_list(client, path, API["virtual_machines"]),
-                [],
-            )
-        return [shape_vm(v) for v in raw]
+        # Resource ids are compared case-insensitively: ARM echoes back whatever
+        # casing a resource was created with, and the two passes are not
+        # guaranteed to agree on it.
+        power = {
+            (v.get("id") or "").lower(): _power_state(v.get("properties") or {})
+            for v in statuses
+        }
+        for vm in vms:
+            vm["power_state"] = power.get((vm["id"] or "").lower())
+        return vms
 
     def list_backup():
         """Vaults and their policies, from both of Azure's backup families.

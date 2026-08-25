@@ -46,8 +46,30 @@ subscription rather than one region, so status lives on the subscription record
 and each resource carries its own `location`. A `locations` array on each record
 rolls up the locations that subscription actually has resources in.
 
-The practical effect is that an Azure scan is far cheaper: roughly six calls per
-subscription, against the AWS edition's six calls per region per account.
+The practical effect is that an Azure scan is far cheaper: roughly seven calls
+per subscription, against the AWS edition's six calls per region per account.
+
+## How VM power state is collected
+
+A stopped VM still paying for its disks is one of the findings a scoping run
+exists to surface, so `power_state` is collected for every VM. Getting it at
+subscription scope is not obvious, and is worth writing down:
+
+```
+GET /subscriptions/<sub>/providers/Microsoft.Compute/virtualMachines?$expand=instanceView
+```
+
+does **not** work. ARM rejects it with *"Expand Instance View is only supported
+when Virtual Machine Scale Set resource filter is applied"* — the inline expand
+is only honoured for a scale-set-filtered query. The supported route for a whole
+subscription is a second pass with `statusOnly=true`, which returns each VM's
+run-time status.
+
+So the tool lists VMs plain first — that call is the one that must not be lost —
+and then merges run state in from the status pass, matching on resource id. If
+the status pass fails, every VM is still reported with `power_state: null` and
+the subscription is marked `partial` with the reason. Losing run state is a far
+smaller loss than losing the fleet.
 
 ## Prerequisites
 
@@ -364,7 +386,7 @@ testable would mean testing a tool nobody runs.
 | `10_diagnostics_on_stderr` | The file is the only product; stdout stays clean |
 | `11_corrupt_payload` | An unparseable response is reported, not read as empty |
 | `12_concurrency_ceiling` | Peak parallelism stays within the documented cap |
-| `13_expand_rejected` | A rejected `$expand` costs power state, not the VM list |
+| `13_power_state` | Run state comes from the `statusOnly` pass, and losing it costs one field rather than the fleet |
 | `14_stress_large_subscription` | 4000 disks in one subscription arrive whole |
 
 ### Requirements

@@ -25,7 +25,8 @@ Scenario keys, all optional:
   deny_by_subscription  {"<sub-id>": ["Microsoft.Compute/disks"]}, "*" for all
   throttle            {"Microsoft.Compute/disks": 3} — 429 the first 3 calls
   corrupt             ["Microsoft.Compute/snapshots"] — answer 200 with non-JSON
-  reject_expand       true — 400 any request carrying $expand
+  reject_status_only  true — deny the statusOnly=true pass, to exercise the
+                      degradation where VMs are listed but run state is not
   management_groups   {"mg-id": ["sub-id", ...]}
   delay_ms            sleep this long before answering, to widen the race window
 """
@@ -204,6 +205,26 @@ def make_vms(sub, n, with_instance_view):
             "properties": props,
         })
     return out
+
+
+def make_vm_statuses(sub, n):
+    """What statusOnly=true returns: run-time status, not the whole VM.
+
+    Deliberately reduced to the fields ARM documents for this pass, so a tool
+    that quietly depended on the rest of the VM payload being here would fail
+    the suite.
+    """
+    return [{
+        "id": rid(sub, f"rg-{i % 4}", "Microsoft.Compute/virtualMachines", f"vm-{i}"),
+        "name": f"vm-{i}",
+        "type": "Microsoft.Compute/virtualMachines",
+        "location": location_for(i),
+        "properties": {"instanceView": {"statuses": [
+            {"code": "ProvisioningState/succeeded", "displayStatus": "Provisioning succeeded"},
+            {"code": "PowerState/running" if i % 3 else "PowerState/deallocated",
+             "displayStatus": "VM running"},
+        ]}},
+    } for i in range(n)]
 
 
 def make_snapshots(sub, n):
@@ -404,10 +425,6 @@ class Handler(BaseHTTPRequestHandler):
         if SCENARIO.get("delay_ms"):
             time.sleep(SCENARIO["delay_ms"] / 1000.0)
 
-        if SCENARIO.get("reject_expand") and any(k.startswith("$expand") for k in query):
-            return self._error(400, "InvalidParameter",
-                               "The parameter $expand is not supported at this scope.")
-
         parts = [p for p in path.strip("/").split("/") if p]
 
         if parts == ["subscriptions"]:
@@ -484,13 +501,33 @@ class Handler(BaseHTTPRequestHandler):
         if resource_type in (SCENARIO.get("corrupt") or []):
             return self._send(200, b"<html>not json at all</html>", "application/json")
 
-        want_instance_view = any("instanceView" in v for vs in query.values() for v in vs)
+        # Real ARM refuses to expand the instance view at subscription scope —
+        # verbatim, this is what it answers. Modelled unconditionally rather
+        # than behind a scenario flag, because it is not a scenario: it is how
+        # ARM behaves, and the first version of this fake got it wrong, so the
+        # suite passed while a real tenant returned 400.
+        if resource_type == "Microsoft.Compute/virtualMachines" and \
+                any("instanceView" in v for k, vs in query.items()
+                    if k.startswith("$expand") for v in vs):
+            return self._error(
+                400, "BadRequest",
+                "Expand Instance View is only supported when Virtual Machine "
+                "Scale Set resource filter is applied")
+
+        # statusOnly=true is the supported way to get run-time status for every
+        # VM in a subscription.
+        status_only = any(v.lower() == "true" for v in (query.get("statusOnly") or []))
+        if status_only and SCENARIO.get("reject_status_only"):
+            return self._error(403, "AuthorizationFailed",
+                               "The client does not have authorization to perform action "
+                               f"'{resource_type}/read' over scope /subscriptions/{sub}.")
 
         builders = {
             "Microsoft.Compute/disks":
                 lambda: make_disks(sub, count_for(sub, "disks")),
             "Microsoft.Compute/virtualMachines":
-                lambda: make_vms(sub, count_for(sub, "vms"), want_instance_view),
+                lambda: (make_vm_statuses(sub, count_for(sub, "vms")) if status_only
+                         else make_vms(sub, count_for(sub, "vms"), False)),
             "Microsoft.Compute/snapshots":
                 lambda: make_snapshots(sub, count_for(sub, "snapshots")),
             "Microsoft.Compute/images":
