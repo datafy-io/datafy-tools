@@ -4,6 +4,12 @@ Inventories EBS volumes, EC2 instances, AMIs, snapshots, DLM policies, and AWS B
 
 **Read-only. No writes, no mutations. Safe to run in production.**
 
+> **Running on Azure?** See **[azure/](azure/)** for the Azure edition, which
+> collects the equivalent data — managed disks, VMs, scale sets, snapshots,
+> images and backup policies — across the subscriptions in a tenant. It needs no
+> role to assume and nothing provisioned in your tenant; its README covers how
+> it differs from this one.
+
 ## What it collects
 
 | Data | Fields |
@@ -163,6 +169,9 @@ By default the tool scans all accounts in the organization. Use these flags to n
 
 ## Implementations
 
+Three implementations of the AWS edition, sharing one interface and one output
+format. (The [Azure edition](azure/) is Python only.)
+
 | | [Python](python/) | [Go](golang/) | [Bash](bash/) |
 |---|---|---|---|
 | **Requirements** | Python 3.8+, boto3 | Pre-built binary or Go 1.21+ | aws-cli v2, jq, bash 4.3+ |
@@ -198,6 +207,9 @@ Three suites, none of which needs an AWS account:
 ./test/parity/run_parity.sh          # all three, output diffed line for line
 ./bash/test/run_tests.sh             # bash-internal checks
 ```
+
+The Azure edition has [its own suite](azure/README.md#tests), run with
+`./azure/test/run_tests.sh`.
 
 ### The behavioural suite — `test/`
 
