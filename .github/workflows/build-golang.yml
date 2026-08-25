@@ -35,15 +35,15 @@ jobs:
 
       - uses: actions/setup-go@v5
         with:
-          go-version-file: discovery-tool/golang/go.mod
-          cache-dependency-path: discovery-tool/golang/go.sum
+          go-version-file: discovery-tool/aws/golang/go.mod
+          cache-dependency-path: discovery-tool/aws/golang/go.sum
 
       - name: Download modules
-        working-directory: discovery-tool/golang
+        working-directory: discovery-tool/aws/golang
         run: go mod tidy
 
       - name: Build
-        working-directory: discovery-tool/golang
+        working-directory: discovery-tool/aws/golang
         env:
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
@@ -56,7 +56,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: discovery-${{ matrix.goos }}-${{ matrix.goarch }}
-          path: discovery-tool/golang/discovery-*
+          path: discovery-tool/aws/golang/discovery-*
           if-no-files-found: error
 
   release:
@@ -77,8 +77,8 @@ jobs:
 
       - name: Stage release assets
         run: |
-          cp discovery-tool/bash/discovery.sh    artifacts/discovery.sh
-          cp discovery-tool/python/discovery.py  artifacts/discovery.py
+          cp discovery-tool/aws/bash/discovery.sh    artifacts/discovery.sh
+          cp discovery-tool/aws/python/discovery.py  artifacts/discovery.py
 
       - name: Create GitHub release
         uses: softprops/action-gh-release@v2

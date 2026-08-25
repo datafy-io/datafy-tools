@@ -11,8 +11,8 @@ which is off by default. With it, the tool assigns itself the built-in **Reader*
 role for the duration of the scan and always removes it again. Nothing else in
 the tool writes anything, ever.
 
-This is the Azure edition. The [AWS edition](../README.md) lives alongside it and
-collects the equivalent data from an AWS Organization.
+This is the Azure edition. See the [AWS edition](../aws/) for AWS Organizations,
+or the [overview](../README.md) for what the two have in common.
 
 ## What it collects
 
@@ -58,27 +58,16 @@ rolls up the locations that subscription actually has resources in.
 The practical effect is that an Azure scan is far cheaper: roughly seven calls
 per subscription, against the AWS edition's six calls per region per account.
 
-## How VM power state is collected
+## VM power state
 
-A stopped VM still paying for its disks is one of the findings a scoping run
-exists to surface, so `power_state` is collected for every VM. Getting it at
-subscription scope is not obvious, and is worth writing down:
+A stopped VM still pays for its disks, so `power_state` is collected for every
+virtual machine alongside the inventory.
 
-```
-GET /subscriptions/<sub>/providers/Microsoft.Compute/virtualMachines?$expand=instanceView
-```
-
-does **not** work. ARM rejects it with *"Expand Instance View is only supported
-when Virtual Machine Scale Set resource filter is applied"* — the inline expand
-is only honoured for a scale-set-filtered query. The supported route for a whole
-subscription is a second pass with `statusOnly=true`, which returns each VM's
-run-time status.
-
-So the tool lists VMs plain first — that call is the one that must not be lost —
-and then merges run state in from the status pass, matching on resource id. If
-the status pass fails, every VM is still reported with `power_state: null` and
-the subscription is marked `partial` with the reason. Losing run state is a far
-smaller loss than losing the fleet.
+It comes from a second ARM call — the run-time status pass — because Azure
+returns a VM's run state separately from its configuration. If your identity can
+list VMs but not their run-time status, every VM is still reported with
+`power_state: null` and the subscription is marked `partial` with the reason, so
+the missing field is always explained rather than silently absent.
 
 ## Prerequisites
 
@@ -166,13 +155,12 @@ only part of the tool that writes anything.
 
 Details worth knowing:
 
-- **The wait is not optional.** Azure does not make a role assignment effective
-  the moment it is written. Scanning immediately would miss precisely the
-  subscriptions the flag was used to reach — a failure that looks exactly like
-  the flag not working, right after it did. The tool polls until the new access
-  is usable, reporting progress, and gives up after `AZURE_PROPAGATION_TIMEOUT`
-  (default 300s) rather than hanging. Subscriptions still out of reach at that
-  point are recorded the ordinary way, with a reason.
+- **It waits for the assignment to take effect.** Azure role assignments are not
+  usable the instant they are created; propagation can take a few minutes. The
+  tool polls until the new access works, reporting progress as it goes, and
+  stops waiting after `AZURE_PROPAGATION_TIMEOUT` (default 300s) rather than
+  hanging. Anything still out of reach by then is recorded in the output with a
+  reason, as usual.
 - **A standing grant is never revoked.** If Reader is already assigned, the tool
   says so, leaves it alone, and does not remove it at the end. Only assignments
   this run created are torn down.
@@ -304,38 +292,33 @@ is reported as an error against the subscription, never as an empty result.
 
 ## Knowing what you did *not* scan
 
-This is the part of the Azure edition that differs most from AWS, and it is
-worth understanding before reading a result.
+Azure lists the subscriptions an identity **can already see**. A subscription
+that no role assignment reaches is not reported as denied — it is simply not
+returned. On its own, that would make a partially-granted tenant look identical
+to a fully-scanned smaller one.
 
-`GET /subscriptions` returns **only the subscriptions the identity can already
-see**. A subscription that no role assignment reaches is not listed as denied —
-it is simply absent. AWS has no equivalent problem: `organizations:ListAccounts`
-names every account in the org whether or not it can be assumed into, so the
-denominator is free.
+So the tool does not treat that list as the last word on what your tenant
+contains. It also asks the management group hierarchy, which lists subscriptions
+by membership rather than by access, and reconciles the two:
 
-Left alone, that means a tenant of two hundred subscriptions with Reader on
-three would report *"3 total, 3 scanned, 0 failed"* — byte-for-byte what a
-healthy three-subscription tenant reports.
-
-So the tool does not trust that call as its denominator. It asks the management
-group hierarchy what the tenant actually contains, because that lists
-subscriptions by membership rather than by access:
-
-- Anything in the hierarchy that `/subscriptions` did not return is written to
-  the file as a `failed` subscription, with a reason naming the missing role
-  assignment. It counts towards `subscriptions_total`.
-- If the hierarchy cannot be read either, no denominator exists and the run
-  genuinely cannot vouch for its own completeness. It says so — loudly on
-  stderr, and in the summary record as `scope_verified: false` with a
-  `scope_note` explaining why.
+- A subscription in the hierarchy that the identity cannot read is written to
+  the file as `failed`, with a reason naming the missing role assignment, and
+  counts towards `subscriptions_total`.
+- If the hierarchy cannot be read either, the run has no way to confirm what it
+  is missing. It says so on stderr and records `scope_verified: false` in the
+  summary, with a `scope_note` explaining why.
 
 ```bash
 # Can these totals be read as full tenant coverage?
 tail -1 discovery_azure_*.json | jq '{scope_verified, scope_note, subscriptions_total}'
 ```
 
-`--setup-role` sidesteps the whole problem: assigning Reader at the tenant root
-makes every subscription visible before the scan starts.
+`scope_verified: true` means the totals describe your tenant. `false` means they
+describe what this identity could see, which may be less.
+
+Using [`--setup-role`](#--setup-role-letting-the-tool-grant-its-own-access)
+avoids the question entirely: Reader is assigned at the tenant root before the
+scan starts, so every subscription is visible.
 
 ## Output format
 
@@ -463,13 +446,13 @@ Each case in `test/cases/` describes the tenant it needs as a scenario —
 subscriptions, resource counts, which providers are denied, whether ARM
 throttles — and then asserts on what came out.
 
-They all talk to `test/lib/fake_arm.py`, a fake Azure Resource Manager reached
-through `AZURE_ARM_ENDPOINT`, so the real `azure-core` pipeline is exercised:
-its credential policy, its retry policy and its `nextLink` pagination all run
-exactly as they would against Azure. The fake speaks **HTTPS** with a
-certificate it generates at startup, because azure-core refuses to attach a
-bearer token to an unencrypted URL — weakening that in the tool to make it
-testable would mean testing a tool nobody runs.
+They all talk to `test/lib/fake_arm.py`, a stand-in Azure Resource Manager
+reached through `AZURE_ARM_ENDPOINT`, so the real `azure-core` pipeline is
+exercised end to end: its credential policy, its retry policy and its `nextLink`
+pagination all run exactly as they would against Azure. It is served over HTTPS,
+so the tool's own transport security is never relaxed in order to test it.
+
+No Azure account or credentials are needed to run the suite.
 
 | Case | Covers |
 |---|---|
@@ -502,17 +485,11 @@ testable would mean testing a tool nobody runs.
 DISCOVERY_PYTHON=/path/to/venv/bin/python ./test/run_tests.sh
 ```
 
-## Why raw ARM JSON rather than the management SDKs
+## Why only one dependency
 
-The tool calls ARM through `azure-core`'s pipeline and reads the raw JSON,
-rather than using `azure-mgmt-compute` and friends. Two reasons:
-
-- **One dependency instead of seven.** A design partner running this in Cloud
-  Shell installs `azure-identity` and nothing else.
-- **A stable output shape.** The generated SDK models reshape between major
-  versions — v38 of `azure-mgmt-compute` moved every property under
-  `.properties`, renamed `diskMBpsReadWrite` to `disk_m_bps_read_write`, and
-  renders enums as `DiskState.ATTACHED` rather than `Attached`. A discovery file
-  whose field names depend on which SDK version the customer happened to install
-  is not comparable between runs. The ARM wire format is versioned by the
-  `api-version` this tool pins.
+The tool calls Azure Resource Manager directly through `azure-core`'s HTTP
+pipeline rather than through the `azure-mgmt-*` service libraries. That keeps
+installation to a single package — useful in Cloud Shell and in locked-down
+environments — and it means the field names in the output are fixed by the
+`api-version` this tool pins, so two runs are always comparable regardless of
+which library versions happen to be installed.
