@@ -76,12 +76,22 @@ jobs:
         working-directory: discovery-tool/azure/golang
         run: go vet ./...
 
+      # Collected into one directory before upload. upload-artifact roots the
+      # archive at the least common ancestor of the paths it matches, so listing
+      # the two golang directories directly would nest the binaries under
+      # aws/golang/ and azure/golang/ inside the artifact — and the release
+      # job's artifacts/discovery-* glob would then match none of them.
+      - name: Collect binaries
+        run: |
+          mkdir -p dist
+          cp discovery-tool/aws/golang/discovery-aws-*     dist/
+          cp discovery-tool/azure/golang/discovery-azure-* dist/
+          ls -l dist
+
       - uses: actions/upload-artifact@v4
         with:
           name: discovery-${{ matrix.goos }}-${{ matrix.goarch }}
-          path: |
-            discovery-tool/aws/golang/discovery-aws-*
-            discovery-tool/azure/golang/discovery-azure-*
+          path: dist/discovery-*
           if-no-files-found: error
 
   release:
@@ -106,6 +116,29 @@ jobs:
           cp discovery-tool/aws/python/discovery.py    artifacts/discovery-aws.py
           cp discovery-tool/azure/bash/discovery.sh    artifacts/discovery-azure.sh
           cp discovery-tool/azure/python/discovery.py  artifacts/discovery-azure.py
+
+      # A release missing an asset still publishes successfully and simply has a
+      # dead download link, which is only noticed by whoever tries to use it.
+      # Every file the release notes advertise is checked to exist first.
+      - name: Verify every advertised asset is present
+        run: |
+          missing=0
+          for cloud in aws azure; do
+            for target in linux-amd64 linux-arm64 darwin-amd64 darwin-arm64 windows-amd64.exe; do
+              f="artifacts/discovery-${cloud}-${target}"
+              [ -f "$f" ] || { echo "missing: $f"; missing=1; }
+            done
+            for ext in sh py; do
+              f="artifacts/discovery-${cloud}.${ext}"
+              [ -f "$f" ] || { echo "missing: $f"; missing=1; }
+            done
+          done
+          echo "--- staged assets ---"
+          ls -l artifacts
+          if [ "$missing" -ne 0 ]; then
+            echo "Refusing to publish an incomplete release." >&2
+            exit 1
+          fi
 
       - name: Create GitHub release
         uses: softprops/action-gh-release@v2
