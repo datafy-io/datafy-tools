@@ -29,6 +29,8 @@ jobs:
             goarch: arm64
           - goos: windows
             goarch: amd64
+          - goos: windows
+            goarch: arm64
 
     steps:
       - uses: actions/checkout@v4
@@ -124,7 +126,7 @@ jobs:
         run: |
           missing=0
           for cloud in aws azure; do
-            for target in linux-amd64 linux-arm64 darwin-amd64 darwin-arm64 windows-amd64.exe; do
+            for target in linux-amd64 linux-arm64 darwin-amd64 darwin-arm64 windows-amd64.exe windows-arm64.exe; do
               f="artifacts/discovery-${cloud}-${target}"
               [ -f "$f" ] || { echo "missing: $f"; missing=1; }
             done
@@ -166,6 +168,7 @@ jobs:
             | Go — macOS x86-64 | `discovery-aws-darwin-amd64` | none |
             | Go — macOS Apple Silicon | `discovery-aws-darwin-arm64` | none |
             | Go — Windows x86-64 | `discovery-aws-windows-amd64.exe` | none |
+            | Go — Windows ARM64 | `discovery-aws-windows-arm64.exe` | none |
             | Bash | `discovery-aws.sh` | aws-cli v2, jq |
             | Python | `discovery-aws.py` | Python 3.8+, boto3 |
 
@@ -178,6 +181,7 @@ jobs:
             | Go — macOS x86-64 | `discovery-azure-darwin-amd64` | none |
             | Go — macOS Apple Silicon | `discovery-azure-darwin-arm64` | none |
             | Go — Windows x86-64 | `discovery-azure-windows-amd64.exe` | none |
+            | Go — Windows ARM64 | `discovery-azure-windows-arm64.exe` | none |
             | Bash | `discovery-azure.sh` | curl, jq |
             | Python | `discovery-azure.py` | Python 3.9+, azure-identity |
 
