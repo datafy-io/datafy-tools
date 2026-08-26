@@ -2,7 +2,7 @@ name: Build and Release
 
 on:
   push:
-    branches: [main]
+    branches: [master]
     paths:
       - "discovery-tool/**"
     tags:
@@ -124,31 +124,71 @@ jobs:
 
             Assets are named by cloud: `discovery-aws-*` / `discovery-azure-*` for the Go binaries, and `discovery-aws.{sh,py}` / `discovery-azure.{sh,py}` for the script implementations.
 
-            ## Download
+            ## Download — AWS
 
             | Tool | File | Requirements |
             |------|------|--------------|
-            | Go — Linux x86-64 | `discovery-linux-amd64` | none |
-            | Go — Linux ARM64 | `discovery-linux-arm64` | none |
-            | Go — macOS x86-64 | `discovery-darwin-amd64` | none |
-            | Go — macOS Apple Silicon | `discovery-darwin-arm64` | none |
-            | Go — Windows x86-64 | `discovery-windows-amd64.exe` | none |
-            | Bash | `discovery.sh` | aws-cli v2, jq |
-            | Python | `discovery.py` | Python 3.8+, boto3 |
+            | Go — Linux x86-64 | `discovery-aws-linux-amd64` | none |
+            | Go — Linux ARM64 | `discovery-aws-linux-arm64` | none |
+            | Go — macOS x86-64 | `discovery-aws-darwin-amd64` | none |
+            | Go — macOS Apple Silicon | `discovery-aws-darwin-arm64` | none |
+            | Go — Windows x86-64 | `discovery-aws-windows-amd64.exe` | none |
+            | Bash | `discovery-aws.sh` | aws-cli v2, jq |
+            | Python | `discovery-aws.py` | Python 3.8+, boto3 |
 
-            ## Quick start
+            ## Download — Azure
+
+            | Tool | File | Requirements |
+            |------|------|--------------|
+            | Go — Linux x86-64 | `discovery-azure-linux-amd64` | none |
+            | Go — Linux ARM64 | `discovery-azure-linux-arm64` | none |
+            | Go — macOS x86-64 | `discovery-azure-darwin-amd64` | none |
+            | Go — macOS Apple Silicon | `discovery-azure-darwin-arm64` | none |
+            | Go — Windows x86-64 | `discovery-azure-windows-amd64.exe` | none |
+            | Bash | `discovery-azure.sh` | curl, jq |
+            | Python | `discovery-azure.py` | Python 3.9+, azure-identity |
+
+            ## Quick start — AWS
+
+            Run from the management (root) account.
 
             ```bash
             # Go
-            ./discovery-darwin-arm64 --profile myprofile --setup-role
+            chmod +x discovery-aws-darwin-arm64
+            ./discovery-aws-darwin-arm64 --profile myprofile --setup-role
 
             # Bash
-            chmod +x discovery.sh
-            ./discovery.sh --profile myprofile --setup-role
+            chmod +x discovery-aws.sh
+            ./discovery-aws.sh --profile myprofile --setup-role
 
             # Python
             pip install boto3
-            python3 discovery.py --profile myprofile --setup-role
+            python3 discovery-aws.py --profile myprofile --setup-role
             ```
 
-            See the [README](https://github.com/datafy-io/datafy-tools/blob/main/discovery-tool/README.md) for full usage.
+            ## Quick start — Azure
+
+            Sign in first with `az login`. There is no role to assume: one
+            identity with Reader across the tenant reads every subscription.
+
+            ```bash
+            # Go
+            chmod +x discovery-azure-darwin-arm64
+            ./discovery-azure-darwin-arm64
+
+            # Bash
+            chmod +x discovery-azure.sh
+            ./discovery-azure.sh
+
+            # Python
+            pip install azure-identity
+            python3 discovery-azure.py
+            ```
+
+            Add `--setup-role` to have the tool grant itself Reader for the
+            duration of the scan and remove it afterwards.
+
+            See the [overview](https://github.com/datafy-io/datafy-tools/blob/master/discovery-tool/README.md),
+            the [AWS guide](https://github.com/datafy-io/datafy-tools/blob/master/discovery-tool/aws/README.md)
+            or the [Azure guide](https://github.com/datafy-io/datafy-tools/blob/master/discovery-tool/azure/README.md)
+            for full usage.
