@@ -122,8 +122,8 @@ Each child account role (whether `OrganizationAccountAccessRole`, a custom role,
 | Actions | Notes |
 |---------|-------|
 | `ec2:DescribeVolumes`, `ec2:DescribeInstances`, `ec2:DescribeRegions`, `ec2:DescribeImages`, `ec2:DescribeSnapshots` | EC2 Describe APIs require `Resource: *` — AWS does not support resource-level permissions for these |
-| `dlm:GetLifecyclePolicies` | |
-| `backup:ListBackupPlans` | |
+| `dlm:GetLifecyclePolicies` | Also requires `Resource: *` — AWS defines no resource type for this action |
+| `backup:ListBackupPlans` | Also requires `Resource: *` — AWS defines no resource type for this action |
 
 The role must also trust the management account: `"Principal": {"AWS": "arn:aws:iam::<mgmt-account-id>:root"}`.
 
@@ -238,6 +238,7 @@ test one of the three.
 | `12_unwritable_output` | An unwritable `--output` path fails loudly and early |
 | `13_diagnostics_on_stderr` | The file is the only product; stdout stays clean |
 | `14_throttling_retried` | A throttled call is retried with backoff, and reported if it runs out |
+| `15_setup_role_template` | The role `--setup-role` deploys grants only what AWS will honour (DT-11548) |
 
 ### The parity harness — `test/parity/`
 
@@ -294,8 +295,23 @@ All three implementations share the same interface:
 --include    IDS    Comma-separated account IDs to scan
 --exclude    IDS    Comma-separated account IDs to skip
 --output     FILE   Output file (default: discovery_<timestamp>.json)
+--print-role-template
+                    Print the CloudFormation template --setup-role would deploy,
+                    and exit. Contacts nothing and deploys nothing
 --version           Print version and exit
 ```
+
+### Reviewing the role before deploying it
+
+`--setup-role` creates a role in every target account, so it is reasonable to
+want to read the template first. Print it, and nothing else happens — no AWS
+call is made:
+
+```bash
+./discovery --print-role-template
+```
+
+All three implementations print the same template, byte for byte.
 
 ## Output format
 
