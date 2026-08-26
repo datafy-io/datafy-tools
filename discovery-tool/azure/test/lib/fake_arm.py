@@ -68,8 +68,16 @@ def write_cert(directory):
     directory.mkdir(parents=True, exist_ok=True)
     key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
     name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "localhost")])
-    start = datetime.datetime(2020, 1, 1, tzinfo=datetime.timezone.utc)
-    end   = datetime.datetime(2040, 1, 1, tzinfo=datetime.timezone.utc)
+
+    # Short-lived and fully specified, because Go on macOS applies Apple's
+    # certificate policy: a lifetime over 825 days, or a missing extended key
+    # usage, is rejected outright as "not standards compliant". Python's
+    # requests would have accepted a sloppier certificate, so getting this
+    # right is what lets one fake serve all three implementations.
+    now = datetime.datetime.now(datetime.timezone.utc)
+    start = now - datetime.timedelta(days=1)
+    end = now + datetime.timedelta(days=365)
+
     cert = (
         x509.CertificateBuilder()
         .subject_name(name).issuer_name(name)
@@ -81,6 +89,14 @@ def write_cert(directory):
             x509.IPAddress(ipaddress.ip_address("127.0.0.1")),
         ]), critical=False)
         .add_extension(x509.BasicConstraints(ca=True, path_length=None), critical=True)
+        .add_extension(x509.KeyUsage(
+            digital_signature=True, key_encipherment=True, key_cert_sign=True,
+            content_commitment=False, data_encipherment=False, key_agreement=False,
+            crl_sign=False, encipher_only=False, decipher_only=False,
+        ), critical=True)
+        .add_extension(x509.ExtendedKeyUsage([
+            x509.oid.ExtendedKeyUsageOID.SERVER_AUTH,
+        ]), critical=False)
         .sign(key, hashes.SHA256())
     )
     (directory / "key.pem").write_bytes(key.private_bytes(

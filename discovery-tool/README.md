@@ -12,8 +12,8 @@ Pick the edition for your cloud:
 | **Scope** | Every account in an AWS Organization | Every subscription in an Azure tenant |
 | **Collects** | EBS volumes, EC2 instances, AMIs, snapshots, DLM policies, AWS Backup plans | Managed disks, VMs, scale sets, snapshots, images, backup vaults and policies |
 | **Run it from** | The management (root) account | Any identity with Reader across the tenant |
-| **Implementations** | Python, Go, Bash | Python |
-| **Requires** | Python 3.8+ and boto3, a prebuilt binary, or aws-cli v2 + jq | Python 3.9+ and `azure-identity` |
+| **Implementations** | Python, Go, Bash | Python, Go, Bash |
+| **Requires** | Python 3.8+ and boto3, a prebuilt binary, or aws-cli v2 + jq | Python 3.9+ and `azure-identity`, a prebuilt binary, or curl + jq |
 
 ## Quick start
 
@@ -26,7 +26,7 @@ cd aws/python && pip install boto3 && python3 discovery.py --profile myprofile
 **Azure** — see [azure/README.md](azure/README.md) for permissions.
 
 ```bash
-cd azure && pip install azure-identity && az login && python3 discovery.py
+cd azure/python && pip install azure-identity && az login && python3 discovery.py
 ```
 
 ## What the two editions have in common
@@ -71,8 +71,15 @@ Each edition's README explains its own model in full.
 Neither suite needs a cloud account or credentials.
 
 ```bash
-./aws/test/run_tests.sh        # AWS: every case, on all three implementations
-./aws/test/parity/run_parity.sh # AWS: all three, output diffed line for line
-./aws/bash/test/run_tests.sh   # AWS: bash-internal checks
-./azure/test/run_tests.sh      # Azure: every case
+# AWS
+./aws/test/run_tests.sh             # every case, on all three implementations
+./aws/test/parity/run_parity.sh     # all three, output diffed line for line
+./aws/bash/test/run_tests.sh        # bash-internal checks
+
+# Azure
+./azure/test/run_tests.sh           # every case, on all three implementations
+./azure/test/parity/run_parity.sh   # all three, output diffed line for line
 ```
+
+Each edition holds its three implementations to one output format, checked by
+its own parity harness.

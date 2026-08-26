@@ -30,7 +30,13 @@ grep -q "bbbbbbbb-0000-0000-0000-000000000002" "$STDERR_FILE" \
 # --version is the exception: there the version *is* the output, so it goes to
 # stdout where a caller can capture it.
 : > "$STDOUT_FILE"; : > "$STDERR_FILE"
-"$PYTHON_BIN" "$DISCOVERY" --version >"$STDOUT_FILE" 2>"$STDERR_FILE"
+run_version() {
+  local argv; argv="$(_discovery_argv)"
+  local IFS='|'
+  # shellcheck disable=SC2086
+  ${argv} --version >"$STDOUT_FILE" 2>"$STDERR_FILE"
+}
+run_version
 version_status=$?
 
 assert_equals 0 "$version_status" "--version exits 0"

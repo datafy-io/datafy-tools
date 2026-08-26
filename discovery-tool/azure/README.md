@@ -69,15 +69,26 @@ list VMs but not their run-time status, every VM is still reported with
 `power_state: null` and the subscription is marked `partial` with the reason, so
 the missing field is always explained rather than silently absent.
 
-## Prerequisites
+## Implementations
 
-- **Python 3.9+**
-- **`pip install azure-identity`** — the only dependency. It brings `azure-core`,
-  which carries the HTTP pipeline the tool uses.
-- An Azure identity with Reader on the subscriptions you want scanned.
+Three implementations, one interface, one output format. All three read ARM
+directly and produce byte-identical files — the [parity harness](#the-parity-harness)
+diffs them line for line.
+
+| | [Python](python/) | [Go](golang/) | [Bash](bash/) |
+|---|---|---|---|
+| **Requirements** | Python 3.9+, `azure-identity` | Pre-built binary, or Go 1.21+ | `curl`, `jq`, bash 3.2+ |
+| **Best for** | Cloud Shell, quick runs | Speed, no runtime dependencies | Minimal or locked-down environments |
+| **Sign-in methods** | Azure CLI, managed identity, service principal, `AZURE_ACCESS_TOKEN` | Same as Python | Azure CLI or `AZURE_ACCESS_TOKEN` |
 
 Azure Cloud Shell has `azure-identity` preinstalled and is already signed in, so
-there is nothing to set up there.
+the Python implementation needs nothing set up there.
+
+The bash implementation talks to ARM with `curl` rather than shelling out to
+`az` for each request: `az` pays Python interpreter startup on every
+invocation, and a tenant-wide scan makes thousands of calls. It uses `az` once,
+for a token, and not at all if `AZURE_ACCESS_TOKEN` is set — which is what lets
+it run somewhere the CLI is not installed.
 
 ## Signing in
 
@@ -202,11 +213,29 @@ The tool calls only these, all reads:
 
 ## Quick start
 
+**Python** (recommended for Cloud Shell):
+
 ```bash
 pip install azure-identity
 az login
-python3 discovery.py
+python3 python/discovery.py
 ```
+
+**Go** (recommended for speed):
+
+```bash
+az login
+cd golang && go build -o discovery . && ./discovery
+```
+
+**Bash** (needs only `curl` and `jq`):
+
+```bash
+az login
+./bash/discovery.sh
+```
+
+All three accept the same flags.
 
 ## Scope options
 
@@ -437,22 +466,28 @@ cat run1.json run2.json > combined.json
 
 ## Tests
 
+Three suites, none of which needs an Azure subscription or credentials.
+
 ```bash
-./test/run_tests.sh          # every case
-./test/run_tests.sh 02 08    # cases matching these patterns
+./test/run_tests.sh                     # every case, on all three implementations
+./test/run_tests.sh --impl go 02        # one implementation, one case
+./test/parity/run_parity.sh             # all three, output diffed line for line
 ```
+
+### The behavioural suite — `test/`
 
 Each case in `test/cases/` describes the tenant it needs as a scenario —
 subscriptions, resource counts, which providers are denied, whether ARM
-throttles — and then asserts on what came out.
+throttles, whether a subscription is visible at all — and then asserts on what
+came out, without naming any implementation. Every case runs **once per
+implementation**.
 
 They all talk to `test/lib/fake_arm.py`, a stand-in Azure Resource Manager
-reached through `AZURE_ARM_ENDPOINT`, so the real `azure-core` pipeline is
-exercised end to end: its credential policy, its retry policy and its `nextLink`
-pagination all run exactly as they would against Azure. It is served over HTTPS,
-so the tool's own transport security is never relaxed in order to test it.
-
-No Azure account or credentials are needed to run the suite.
+reached through `AZURE_ARM_ENDPOINT`, so each implementation's real HTTP stack
+is exercised end to end — azure-core's pipeline for Python, `net/http` for Go,
+`curl` for bash — including their pagination and their error handling. Mocking
+any one of them instead would only ever test that one. It is served over HTTPS,
+so no implementation's transport security is relaxed in order to test it.
 
 | Case | Covers |
 |---|---|
@@ -469,27 +504,64 @@ No Azure account or credentials are needed to run the suite.
 | `10_diagnostics_on_stderr` | The file is the only product; stdout stays clean |
 | `11_corrupt_payload` | An unparseable response is reported, not read as empty |
 | `12_concurrency_ceiling` | Peak parallelism stays within the documented cap |
-| `13_power_state` | Run state comes from the `statusOnly` pass, and losing it costs one field rather than the fleet |
+| `13_power_state` | Run state comes from the status pass, and losing it costs one field rather than the fleet |
 | `14_stress_large_subscription` | 4000 disks in one subscription arrive whole |
-| `15_partial_grant` | A half-granted tenant cannot pass itself off as a fully-scanned one |
-| `16_scope_unverifiable` | With no denominator available, the file says so rather than implying coverage |
-| `17_setup_role` | `--setup-role` grants, scans, and always cleans up — including when the run fails |
+| `15_partial_grant` | A half-granted tenant cannot pass itself off as fully scanned |
+| `16_scope_unverifiable` | With no denominator available, the file says so |
+| `17_setup_role` | `--setup-role` grants, scans, and always cleans up |
 | `18_setup_role_propagation` | The scan waits for RBAC to propagate, and bounds that wait |
+
+### The parity harness
+
+Where the behavioural suite asks whether each implementation is *correct*, the
+parity harness asks whether they are *identical*: one scenario through all
+three, output diffed line for line. That catches drift the per-case assertions
+would not think to look for — a renamed field, a differently rounded number, a
+reordered array, a null that became an empty string.
+
+Only the wall-clock timestamp is excluded from the diff. Every field name, every
+value and every error string has to match exactly.
 
 ### Requirements
 
-`jq` and `curl`, plus a Python that has `azure-identity` installed. Point
-`DISCOVERY_PYTHON` at a virtualenv if the default `python3` does not have it:
+`jq` and `curl`, plus the toolchain of each implementation under test: a Python
+with `azure-identity` for the Python one, `go` for the Go one, nothing extra for
+bash. The stand-in ARM is itself Python and generates a TLS certificate, so a
+Python with `cryptography` is needed even to test only bash or Go.
+
+Point `DISCOVERY_PYTHON` at a virtualenv if the default `python3` does not have
+what is needed:
 
 ```bash
 DISCOVERY_PYTHON=/path/to/venv/bin/python ./test/run_tests.sh
 ```
 
-## Why only one dependency
+An implementation whose toolchain is missing is reported as skipped rather than
+silently passing.
 
-The tool calls Azure Resource Manager directly through `azure-core`'s HTTP
-pipeline rather than through the `azure-mgmt-*` service libraries. That keeps
-installation to a single package — useful in Cloud Shell and in locked-down
-environments — and it means the field names in the output are fixed by the
-`api-version` this tool pins, so two runs are always comparable regardless of
-which library versions happen to be installed.
+### Differences the suites deliberately allow
+
+The three are held to the same output, the same statuses and the same exit
+codes. What is left to differ follows from the runtime:
+
+- **Sign-in methods.** Python and Go use `DefaultAzureCredential`, so they cover
+  managed identity, workload identity and service principal environment
+  variables. Bash uses the Azure CLI or `AZURE_ACCESS_TOKEN` — which is also
+  what lets it run where neither an SDK nor the CLI is installed.
+- **Private CA configuration.** Each stack has its own convention:
+  `REQUESTS_CA_BUNDLE` for Python, `CURL_CA_BUNDLE` for bash, and
+  `AZURE_CA_BUNDLE` or `SSL_CERT_FILE` for Go. Go reads it explicitly because on
+  macOS it uses the platform verifier and would otherwise ignore it.
+
+## Why raw ARM JSON
+
+All three implementations call Azure Resource Manager directly and read the raw
+JSON, rather than going through the `azure-mgmt-*` service libraries or the
+generated Go packages. Two reasons:
+
+- **Almost nothing to install.** The Python implementation needs one package;
+  the bash one needs `curl` and `jq`; the Go one is a single static binary.
+- **A stable output shape.** The field names in the output are fixed by the
+  `api-version` this tool pins, so two runs are comparable regardless of which
+  library versions happen to be installed — and the three implementations can be
+  held to byte-identical output, which is what the parity harness checks.

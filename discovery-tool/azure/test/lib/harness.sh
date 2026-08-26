@@ -4,28 +4,53 @@
 # Sourced by run_tests.sh before each case file. A case describes the tenant it
 # wants as a scenario, calls run_discovery, and asserts on the output.
 #
+# Sourced once per implementation, so every case runs against bash, Python and
+# Go in turn. A case describes the tenant it needs and asserts on what came out,
+# without ever naming an implementation.
+#
 # Everything talks to test/lib/fake_arm.py — a fake ARM served over HTTPS —
-# through AZURE_ARM_ENDPOINT. The real azure-core pipeline is under test:
-# its credential policy, its retry policy and its nextLink pagination all run
-# exactly as they would against Azure. HTTPS rather than plain http because
-# azure-core refuses to attach a bearer token to an unencrypted URL, and
-# weakening that in the tool to make it testable would be testing a tool nobody
-# runs.
+# through AZURE_ARM_ENDPOINT, so the real HTTP stack of each implementation is
+# exercised: azure-core's pipeline for Python, net/http for Go, curl for bash,
+# including their pagination and their error handling. Mocking any one of them
+# instead would only ever test that one.
+#
+# HTTPS rather than plain http because azure-core refuses to attach a bearer
+# token to an unencrypted URL; relaxing that in the tool to make it testable
+# would mean testing a tool nobody runs.
 
 TEST_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TEST_ROOT="$(dirname "$TEST_LIB_DIR")"
 AZURE_ROOT="$(dirname "$TEST_ROOT")"
 FAKE_ARM="$TEST_LIB_DIR/fake_arm.py"
-DISCOVERY="$AZURE_ROOT/discovery.py"
-
 PYTHON_BIN="${DISCOVERY_PYTHON:-python3}"
+
+# ── Implementation profiles ────────────────────────────────────────────────────
+# $IMPL selects which implementation the current pass exercises. A case asserts
+# on behaviour and never names one.
+
+impl_display_name() {
+  case "$IMPL" in
+    bash)   echo "bash/discovery.sh" ;;
+    python) echo "python/discovery.py" ;;
+    go)     echo "golang (compiled)" ;;
+  esac
+}
+
+# The command for the implementation under test, as pipe-separated words.
+_discovery_argv() {
+  case "$IMPL" in
+    bash)   echo "bash|$AZURE_ROOT/bash/discovery.sh" ;;
+    python) echo "$PYTHON_BIN|$AZURE_ROOT/python/discovery.py" ;;
+    go)     echo "$DISCOVERY_GO_BIN" ;;
+  esac
+}
 
 FAILURES=0
 ASSERTIONS=0
 
 # Most subscriptions the tool may have in flight at once, and most ARM calls.
-# Both are pinned constants in discovery.py; a case asserts the tool stays
-# within them rather than re-deriving them.
+# All three implementations pin the same two constants; a case asserts the tool
+# stays within them rather than re-deriving them.
 impl_subscription_cap() { echo 20; }
 impl_call_cap()         { echo $(( 20 * 8 )); }
 
@@ -111,8 +136,13 @@ print(".".join([
 PY
 )"
   export AZURE_ACCESS_TOKEN
-  # How requests learns to trust the fake's self-signed certificate.
+  # How each implementation learns to trust the fake's self-signed certificate.
+  # Three variables because three HTTP stacks: requests (Python), Go's
+  # crypto/x509, and curl. None of them is a test-only switch in the tool —
+  # each is the standard way its stack is told about a private CA.
   export REQUESTS_CA_BUNDLE="$CERT_DIR/cert.pem"
+  export SSL_CERT_FILE="$CERT_DIR/cert.pem"
+  export CURL_CA_BUNDLE="$CERT_DIR/cert.pem"
   # Keep the backoff short: cases that exercise retries should not spend the
   # suite's wall-clock sleeping.
   export AZURE_RETRY_BACKOFF="${AZURE_RETRY_BACKOFF:-0.01}"
@@ -152,8 +182,10 @@ run_discovery_to() {
   start_fake || return 1
   local out="$1"; shift
   DISCOVERY_STATUS=0
-  "$PYTHON_BIN" "$DISCOVERY" --output "$out" "$@" \
-    >"$STDOUT_FILE" 2>"$STDERR_FILE" || DISCOVERY_STATUS=$?
+  local argv; argv="$(_discovery_argv)"
+  local IFS='|'
+  # shellcheck disable=SC2086 — splitting the pipe-separated argv is deliberate
+  ${argv} --output "$out" "$@" >"$STDOUT_FILE" 2>"$STDERR_FILE" || DISCOVERY_STATUS=$?
 }
 
 run_discovery() { run_discovery_to "$OUTPUT_FILE" "$@"; }
@@ -162,8 +194,10 @@ run_discovery() { run_discovery_to "$OUTPUT_FILE" "$@"; }
 run_discovery_bg() {
   start_fake || return 1
   DISCOVERY_STATUS=""
-  "$PYTHON_BIN" "$DISCOVERY" --output "$OUTPUT_FILE" "$@" \
-    >"$STDOUT_FILE" 2>"$STDERR_FILE" &
+  local argv; argv="$(_discovery_argv)"
+  local IFS='|'
+  # shellcheck disable=SC2086
+  ${argv} --output "$OUTPUT_FILE" "$@" >"$STDOUT_FILE" 2>"$STDERR_FILE" &
   DISCOVERY_PID=$!
 }
 

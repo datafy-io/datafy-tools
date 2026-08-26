@@ -36,27 +36,52 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: discovery-tool/aws/golang/go.mod
-          cache-dependency-path: discovery-tool/aws/golang/go.sum
+          cache-dependency-path: |
+            discovery-tool/aws/golang/go.sum
+            discovery-tool/azure/golang/go.sum
 
-      - name: Download modules
+      # Both editions ship a Go binary, built from the same matrix so a platform
+      # is either covered for both clouds or for neither.
+      - name: Download modules (AWS)
         working-directory: discovery-tool/aws/golang
         run: go mod tidy
 
-      - name: Build
+      - name: Download modules (Azure)
+        working-directory: discovery-tool/azure/golang
+        run: go mod tidy
+
+      - name: Build (AWS)
         working-directory: discovery-tool/aws/golang
         env:
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
           CGO_ENABLED: "0"
         run: |
-          BIN=discovery-${{ matrix.goos }}-${{ matrix.goarch }}
+          BIN=discovery-aws-${{ matrix.goos }}-${{ matrix.goarch }}
           [ "${{ matrix.goos }}" = "windows" ] && BIN="${BIN}.exe"
           go build -ldflags="-s -w" -o "${BIN}" .
+
+      - name: Build (Azure)
+        working-directory: discovery-tool/azure/golang
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: "0"
+        run: |
+          BIN=discovery-azure-${{ matrix.goos }}-${{ matrix.goarch }}
+          [ "${{ matrix.goos }}" = "windows" ] && BIN="${BIN}.exe"
+          go build -ldflags="-s -w" -o "${BIN}" .
+
+      - name: Vet (Azure)
+        working-directory: discovery-tool/azure/golang
+        run: go vet ./...
 
       - uses: actions/upload-artifact@v4
         with:
           name: discovery-${{ matrix.goos }}-${{ matrix.goarch }}
-          path: discovery-tool/aws/golang/discovery-*
+          path: |
+            discovery-tool/aws/golang/discovery-aws-*
+            discovery-tool/azure/golang/discovery-azure-*
           if-no-files-found: error
 
   release:
@@ -77,21 +102,27 @@ jobs:
 
       - name: Stage release assets
         run: |
-          cp discovery-tool/aws/bash/discovery.sh    artifacts/discovery.sh
-          cp discovery-tool/aws/python/discovery.py  artifacts/discovery.py
+          cp discovery-tool/aws/bash/discovery.sh      artifacts/discovery-aws.sh
+          cp discovery-tool/aws/python/discovery.py    artifacts/discovery-aws.py
+          cp discovery-tool/azure/bash/discovery.sh    artifacts/discovery-azure.sh
+          cp discovery-tool/azure/python/discovery.py  artifacts/discovery-azure.py
 
       - name: Create GitHub release
         uses: softprops/action-gh-release@v2
         with:
           files: |
             artifacts/discovery-*
-            artifacts/discovery.sh
-            artifacts/discovery.py
           generate_release_notes: true
           body: |
             ## Datafy Discovery Tool ${{ github.ref_name }}
 
-            Inventories EBS volumes, EC2 instances, AMIs, snapshots, DLM policies, and AWS Backup plans across all accounts in an AWS Organization. Output is one JSON object per account × region (JSONL format).
+            Inventories the block storage and compute footprint of a cloud estate, so a Datafy engagement can be scoped before installation. Output is one JSON object per unit of scope (JSONL format).
+
+            **AWS** — EBS volumes, EC2 instances, AMIs, snapshots, DLM policies and AWS Backup plans, across every account in an Organization. One record per account × region.
+
+            **Azure** — managed disks, VMs, scale sets, snapshots, images, backup vaults and policies, across every subscription in a tenant. One record per subscription.
+
+            Assets are named by cloud: `discovery-aws-*` / `discovery-azure-*` for the Go binaries, and `discovery-aws.{sh,py}` / `discovery-azure.{sh,py}` for the script implementations.
 
             ## Download
 
