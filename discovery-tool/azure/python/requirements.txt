@@ -1,0 +1,4 @@
+# The only dependency. It brings azure-core, which carries the HTTP pipeline
+# the tool uses, and cryptography, which the test suite's fake ARM endpoint
+# uses to generate its TLS certificate.
+azure-identity>=1.15
