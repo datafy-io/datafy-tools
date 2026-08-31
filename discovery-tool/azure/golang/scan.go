@@ -82,10 +82,10 @@ func (c *collector) note(api string, err error) {
 
 // scanSubscription collects all discovery data for one subscription.
 //
-// Azure differs from AWS in where a failure lands. ARM list calls are scoped to
-// a subscription and return every region at once, so a denied read costs a whole
-// subscription rather than one region — which is why the record is per
-// subscription, and why each resource carries its own location.
+// ARM list calls are scoped to a subscription and return every region at once,
+// so a denied read costs a whole subscription rather than one region. That is
+// why the record is per subscription, and why each resource carries its own
+// location.
 func scanSubscription(ctx context.Context, client *armClient, sub subscription) map[string]any {
 	base := "/subscriptions/" + sub.ID + "/providers"
 	col := &collector{}

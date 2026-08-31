@@ -1,11 +1,11 @@
-# An empty subscription and an unreadable one must never look alike. The AWS
-# edition learned this the hard way (DT-11095): every call was `|| echo "[]"`,
-# so a denied read and a genuinely empty region both emitted an empty array and
-# the gap was only found by diffing against an older run.
+# An empty subscription and an unreadable one must never look alike. A call that
+# swallows its failure and returns an empty array makes the two indistinguishable
+# in the output, and the gap is then only findable by diffing against an older
+# run — which nobody does.
 #
-# In Azure the blast radius is larger, because ARM list calls are subscription-
-# scoped: a denied read costs a whole subscription rather than one region. That
-# is exactly why status lives on the subscription record.
+# The blast radius is a whole subscription, because ARM list calls are
+# subscription-scoped: a denied read costs every region in it at once. That is
+# exactly why status lives on the subscription record.
 #
 # Three subscriptions here: one genuinely empty, one denied a single provider,
 # one denied everything.

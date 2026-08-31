@@ -126,10 +126,9 @@ export AZURE_RETRY_BACKOFF_MAX="0.05"
 # order cannot masquerade as a difference. Everything else — every field name,
 # every value, every error string — has to match exactly.
 #
-# This is stricter than the AWS harness can be. There, the three SDKs word the
-# same AWS error completely differently, so the prose has to be truncated before
-# diffing. Here all three implementations build the error text themselves from
-# ARM's own JSON, so the text is ours and it has to agree.
+# The comparison can be exact because all three implementations build their
+# error text themselves from ARM's own JSON rather than from a client library's
+# wording — so the text is ours, and it has to agree.
 normalize() {
   jq -S 'del(.scanned_at)' "$1" 2>/dev/null \
     | jq -sS 'sort_by([.record_type, (.subscription_id // "")])' 2>/dev/null

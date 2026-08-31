@@ -1,13 +1,12 @@
 # The question this case exists to answer: can a half-granted tenant produce a
 # file that looks complete?
 #
-# In AWS it cannot, because organizations:ListAccounts names every account in
-# the org whether or not it can be assumed into — the denominator is free. Azure
-# has no such call. GET /subscriptions returns only the subscriptions the
-# identity can already see; one that no role assignment reaches is not listed as
-# denied, it is simply absent. Trusting it as the denominator means a tenant of
-# six subscriptions with Reader on two reports "2 total, 2 scanned, 0 failed" —
-# byte-for-byte what a healthy two-subscription tenant reports.
+# There is no call that names every subscription in a tenant regardless of
+# access. GET /subscriptions returns only the ones the identity can already see;
+# one that no role assignment reaches is not listed as denied, it is simply
+# absent. Trusting it as the denominator means a tenant of six subscriptions
+# with Reader on two reports "2 total, 2 scanned, 0 failed" — byte-for-byte what
+# a healthy two-subscription tenant reports.
 #
 # The management group hierarchy is the denominator, because it lists
 # subscriptions by membership rather than by access.

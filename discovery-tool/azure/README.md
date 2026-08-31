@@ -11,9 +11,6 @@ which is off by default. With it, the tool assigns itself the built-in **Reader*
 role for the duration of the scan and always removes it again. Nothing else in
 the tool writes anything, ever.
 
-This is the Azure edition. See the [AWS edition](../aws/) for AWS Organizations,
-or the [overview](../README.md) for what the two have in common.
-
 ## What it collects
 
 | Data | Fields |
@@ -30,33 +27,30 @@ Output is one JSON object per subscription (JSONL format), followed by a summary
 record. Subscriptions that could not be scanned are recorded in the file with a
 reason — see [Output format](#output-format).
 
-## How this differs from the AWS edition
+## How it reads your tenant
 
-Two things about Azure change the shape of the tool, and both are visible in the
-output.
+Two things about Azure Resource Manager shape the tool, and both are visible in
+the output.
 
-**There is no role to assume.** AWS needs `sts:AssumeRole` into each member
-account, which is why the AWS edition has `--role` and a CloudFormation StackSet
-to provision one. Azure has none of that: a single identity holding **Reader** at
-the tenant root management group reads every subscription directly, so there is
-no `--role` here and no per-subscription bootstrapping.
+**One identity reads everything — there is no per-subscription setup.** Azure
+RBAC inherits down the management group hierarchy, so a single **Reader**
+assignment at the tenant root covers every subscription beneath it, present and
+future. Nothing is created in your subscriptions and nothing has to be cleaned
+up. If you would rather not grant anything in advance,
+[`--setup-role`](#--setup-role-letting-the-tool-grant-its-own-access) makes that
+one assignment for the duration of the scan and removes it afterwards.
 
-`--setup-role` still exists, and does the same job the StackSet does — grant the
-access, scan, always take it away again — but it is one PUT and one DELETE
-rather than N stack instances, because Azure RBAC inherits down the management
-group hierarchy.
+**A record is a subscription.** ARM list calls are scoped to a subscription and
+return every region at once — listing disks in a subscription returns them in
+all locations in one paginated call. So the unit of both work and failure is the
+subscription: a denied read costs a whole subscription rather than one region.
+That is why `status` lives on the subscription record, why each resource carries
+its own `location`, and why each record has a `locations` array rolling up the
+regions that subscription actually has resources in.
 
-**A record is a subscription, not a region.** AWS's EC2 APIs are regional, so the
-AWS edition makes one set of calls per account × region and reports a status per
-region. Azure Resource Manager list calls are scoped to a *subscription* and
-return every region at once — `disks.list()` on a subscription returns its disks
-in all locations in one paginated call. That means a denied read costs a whole
-subscription rather than one region, so status lives on the subscription record
-and each resource carries its own `location`. A `locations` array on each record
-rolls up the locations that subscription actually has resources in.
-
-The practical effect is that an Azure scan is far cheaper: roughly seven calls
-per subscription, against the AWS edition's six calls per region per account.
+It also makes a scan cheap: roughly seven ARM calls per subscription regardless
+of how many regions it spans, so even a large tenant is a few thousand calls
+rather than a few hundred thousand.
 
 ## VM power state
 
@@ -155,8 +149,7 @@ interrupted, or cannot write its output file.
 python3 discovery.py --setup-role
 ```
 
-This is the counterpart of the AWS edition's `--setup-role` StackSet, and the
-only part of the tool that writes anything.
+This is the only part of the tool that writes anything.
 
 | | Without the flag (default) | With `--setup-role` |
 |---|---|---|
@@ -237,10 +230,38 @@ az login
 
 All three accept the same flags.
 
-## Scope options
+## Running across multiple subscriptions
 
-By default the tool scans every subscription the signed-in identity can see. Use
-these flags to narrow it:
+Scanning many subscriptions is the normal case, not a special one — **you do not
+run the tool once per subscription.** A single run covers every subscription the
+signed-in identity can see, scanning up to 20 of them in parallel, and writes
+one file containing them all.
+
+```bash
+python3 python/discovery.py
+```
+
+That is the whole thing. What varies is only *which* subscriptions are in scope,
+and whether the identity can actually read them.
+
+### Make sure the identity can see them all
+
+This is the part that decides your coverage, and it is worth getting right
+before a long run. A subscription no role assignment reaches is not reported as
+denied by Azure — it is simply not returned — so an under-granted identity
+produces a run that looks complete and is not.
+
+Either grant Reader once at the tenant root management group (see
+[Permissions](#permissions)), or let the tool do it for the duration of the run:
+
+```bash
+python3 python/discovery.py --setup-role
+```
+
+Either way the run tells you whether it could account for the whole tenant — see
+[Knowing what you did *not* scan](#knowing-what-you-did-not-scan).
+
+### Narrowing the scope
 
 | Flag | Description |
 |---|---|
@@ -250,8 +271,73 @@ these flags to narrow it:
 | `--exclude IDS` | Skip these subscription IDs (comma-separated) |
 | `--setup-role` | Grant Reader for the duration of the scan, then remove it |
 
-An `--include` id the identity cannot see is called out in a warning rather than
-quietly producing a shorter run.
+```bash
+# Everything under one management group, nested groups included
+python3 python/discovery.py --management-group mg-production
+
+# Three named subscriptions
+python3 python/discovery.py --include 1111...,2222...,3333...
+
+# Everything except the sandbox ones
+python3 python/discovery.py --exclude 9999...,8888...
+
+# One tenant, when the identity can see several
+python3 python/discovery.py --tenant 0000...
+```
+
+An `--include` id the identity cannot see is recorded in the output as a failed
+subscription, not quietly dropped — so a typo or a missing grant shows up in the
+file rather than as a shorter run.
+
+### Very large tenants
+
+A single run handles hundreds of subscriptions; it parallelises across them and
+rides out ARM's throttling. Splitting a run is worth doing only when you want
+to, say, scan different parts of the estate at different times, or hand
+different teams' subscriptions to different operators.
+
+Each run writes a self-contained file with its own summary line, and the files
+concatenate:
+
+```bash
+python3 python/discovery.py --management-group mg-production --output prod.json
+python3 python/discovery.py --management-group mg-staging    --output staging.json
+
+cat prod.json staging.json > combined.json
+```
+
+Reading a combined file, remember there is one summary line per run rather than
+one overall — so totals are summed across them:
+
+```bash
+jq -s 'map(select(.record_type == "summary"))
+       | { runs: length,
+           subscriptions_total:   (map(.subscriptions_total)   | add),
+           subscriptions_scanned: (map(.subscriptions_scanned) | add),
+           subscriptions_failed:  (map(.subscriptions_failed)  | add),
+           all_scopes_verified:   (all(.scope_verified)) }' combined.json
+```
+
+### What a multi-subscription run looks like
+
+Progress goes to stderr as each subscription finishes, so a long run is never
+silent:
+
+```
+Subscriptions to scan: 142
+
+  [1/142] aaaaaaaa-0000-0000-0000-000000000001 — ok, 318 disks, 121 VMs
+  [2/142] bbbbbbbb-0000-0000-0000-000000000002 — partial, 0 disks, 44 VMs
+         bbbbbbbb-0000-0000-0000-000000000002: Microsoft.Compute/disks: AuthorizationFailed: ...
+  ...
+
+Subscriptions: 142 total, 139 scanned, 2 partial, 1 failed, 0 skipped
+Output:   discovery_azure_20260831_141203.json
+```
+
+Records are written as each subscription completes, so a run stopped part-way
+keeps everything collected up to that point, marks itself interrupted, and exits
+`128 + signal`.
 
 ## Rate limits and retries
 
@@ -259,8 +345,8 @@ Azure Resource Manager enforces per-subscription read quotas, and a tenant-wide
 scan runs into them. A throttled call comes back `429` with a `Retry-After`
 header. The tool pins its retry policy — **10 total attempts**, exponential
 backoff with jitter, honouring `Retry-After` — rather than leaving it to the
-client default, so a run is reproducible and rides out a burst the same way the
-AWS edition does.
+client default, so a run is reproducible rather than depending on which client
+library version happens to be installed.
 
 | Variable | Default | Meaning |
 |---|---|---|
@@ -268,10 +354,9 @@ AWS edition does.
 | `AZURE_RETRY_BACKOFF` | `0.8` | Backoff factor, in seconds |
 | `AZURE_RETRY_BACKOFF_MAX` | `120` | Backoff ceiling, in seconds |
 
-`AZURE_MAX_ATTEMPTS` counts *attempts*, matching `AWS_MAX_ATTEMPTS` in the AWS
-edition. azure-core's own `retry_total` counts *retries* and is therefore one
-lower; the tool converts, so the same number means the same thing in both
-editions.
+`AZURE_MAX_ATTEMPTS` counts *attempts*, the first one included — so `10` means
+one call and nine retries. (azure-core's own `retry_total` counts *retries* and
+is therefore one lower; the tool converts, so you do not have to.)
 
 If a call does exhaust its attempts, the subscription is recorded as `partial` or
 `failed` with the Azure error code in `errors` — never as an empty subscription.

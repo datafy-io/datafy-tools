@@ -1,7 +1,7 @@
 # The file named by --output is the tool's only product. Progress, warnings and
 # the closing tallies go to stderr, so stdout stays clean for the caller and an
 # operator who redirects it still sees which subscriptions were skipped —
-# problems scrolling into /dev/null is part of how DT-11095 stayed invisible.
+# problems scrolling into /dev/null is how a coverage gap stays invisible.
 
 setup_sandbox
 

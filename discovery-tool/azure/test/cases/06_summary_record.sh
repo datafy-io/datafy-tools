@@ -27,7 +27,7 @@ assert_equals "summary" "$(output_lines | tail -1 | jq -r '.record_type')" \
   "the summary is the last line, so a truncated upload is obvious"
 
 assert_equals "azure"  "$(summary_record | jq -r '.cloud')" \
-  "the summary names the cloud, so an Azure file is never mistaken for an AWS one"
+  "the summary names the cloud it came from"
 assert_not_empty "$(summary_record | jq -r '.tool_version')" "the summary carries the tool version"
 assert_equals "false"  "$(summary_record | jq -r '.interrupted')" "a completed run is not marked interrupted"
 

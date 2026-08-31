@@ -89,10 +89,10 @@ func tenantRoots(subs []subscription, tenant, hint string) []string {
 //
 // The hard part in Azure is the denominator. GET /subscriptions returns only the
 // subscriptions the identity can already see — a subscription no role
-// assignment reaches is not listed as denied, it is simply absent. So unlike
-// AWS, where organizations:ListAccounts names every account whether or not it
-// can be assumed into, this call cannot on its own tell a complete scan from a
-// half-granted one.
+// assignment reaches is not listed as denied, it is simply absent.
+// So this call cannot on its own tell a complete scan from a half-granted one:
+// left alone it would report a tenant of two hundred as three subscriptions,
+// indistinguishable from a healthy three-subscription tenant.
 //
 // The management group hierarchy is the denominator, because it lists
 // subscriptions by membership rather than by access.
@@ -253,14 +253,12 @@ func sortedKeys(m map[string]bool) []string {
 }
 
 // ── Reader access setup (--setup-role) ───────────────────────────────────────
-// The Azure counterpart of the AWS edition's CloudFormation StackSet. Same
-// contract: grant the access the scan needs, scan, then always take it away
-// again — including when the scan fails.
+// Grant the access the scan needs, scan, then always take it away again —
+// including when the scan fails.
 //
-// It is a far smaller thing than the AWS one, because Azure RBAC inherits. AWS
-// has to deploy a role into every member account and tear N of them down again;
-// here a single assignment at a tenant root management group covers every
-// subscription beneath it. One PUT, one DELETE.
+// Because Azure RBAC inherits, this is one PUT and one DELETE however large the
+// tenant: a single assignment at a tenant root management group covers every
+// subscription beneath it, present and future.
 
 // tokenClaims returns the claims inside a JWT, without verifying it.
 //

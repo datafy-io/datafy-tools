@@ -21,9 +21,10 @@ Usage:
   # Skip specific subscriptions
   python3 discovery.py --exclude 333...
 
-Unlike the AWS edition there is no role to assume: one identity holding Reader
-at the tenant root management group reads every subscription directly. See
-README.md for how to grant it.
+There is no per-subscription setup: one identity holding Reader at the tenant
+root management group reads every subscription directly, because Azure RBAC
+inherits down the management group hierarchy. See README.md for how to grant it,
+or use --setup-role to have the tool grant it for the duration of the scan.
 """
 
 import argparse
@@ -88,15 +89,14 @@ ARM_SCOPE = os.environ.get("AZURE_ARM_SCOPE") or f"{ARM_ENDPOINT}/.default"
 # Retry policy. A tenant-wide scan makes thousands of ARM calls and Azure
 # Resource Manager throttles per-subscription read quotas long before the end;
 # a throttled call comes back 429 with a Retry-After header. Pinned rather than
-# left to the client default so a run is reproducible, and so this edition rides
-# out a burst the same way the AWS edition does — 10 total attempts, exponential
-# backoff with jitter.
+# left to the client default, so a run is reproducible rather than depending on
+# which azure-core version happens to be installed — 10 total attempts,
+# exponential backoff with jitter.
 #
-# AZURE_MAX_ATTEMPTS counts TOTAL attempts, the first one included, matching
-# AWS_MAX_ATTEMPTS in the AWS edition. azure-core's own retry_total counts
-# *retries*, so it is one lower — the same off-by-one botocore has between
-# "max_attempts" and "total_max_attempts", and the reason neither is passed
-# through raw.
+# AZURE_MAX_ATTEMPTS counts TOTAL attempts, the first one included. azure-core's
+# own retry_total counts *retries*, so it is one lower; the value is converted
+# here rather than passed through raw, so "10" means ten calls at most and not
+# eleven.
 MAX_ATTEMPTS    = max(1, int(os.environ.get("AZURE_MAX_ATTEMPTS") or 10))
 RETRY_BACKOFF   = float(os.environ.get("AZURE_RETRY_BACKOFF") or 0.8)
 RETRY_BACKOFF_MAX = float(os.environ.get("AZURE_RETRY_BACKOFF_MAX") or 120)
@@ -148,7 +148,7 @@ def log(msg):
 
     The tool has one product — the JSONL file named by --output — and stdout is
     left clean for the caller. An operator who redirects stdout must still see
-    that subscriptions were skipped. The AWS edition does the same.
+    that subscriptions were skipped.
     """
     print(msg, file=sys.stderr, flush=True)
 
@@ -284,8 +284,9 @@ def build_client(credential):
         retry_backoff_max=RETRY_BACKOFF_MAX,
         # 429 is the one that matters: ARM answers it with Retry-After when a
         # subscription's read quota is exhausted, which a tenant-wide scan does
-        # routinely. Listed explicitly rather than relying on the default set,
-        # for the same reason the AWS edition pins its retry mode.
+        # routinely. Listed explicitly rather than relying on azure-core's
+        # default set, so the policy is visible here and cannot shift underneath
+        # the tool when the library changes.
         retry_on_status_codes=[408, 429, 500, 502, 503, 504],
     )
     # Order matters, and this is azure-core's own order (see PipelineClient's
@@ -675,10 +676,10 @@ def scan_subscription(client, sub):
     reads were denied. This is the whole reason the tool reports a status per
     subscription rather than letting an exception delete it from the output.
 
-    Azure differs from AWS here in where a failure lands. ARM list calls are
-    scoped to a subscription and return every region at once, so a denied read
-    costs a whole subscription rather than one region — which is why the record
-    is per subscription, and why each resource carries its own location.
+    ARM list calls are scoped to a subscription and return every region at
+    once, so a denied read costs a whole subscription rather than one region.
+    That is why the record is per subscription, and why each resource carries
+    its own location.
     """
     sub_id = sub["subscription_id"]
     base   = f"/subscriptions/{sub_id}/providers"
@@ -930,11 +931,11 @@ def list_subscriptions(client, tenant, management_group, include, exclude,
 
     The hard part in Azure is the denominator. `GET /subscriptions` returns only
     the subscriptions the identity can already see — a subscription no role
-    assignment reaches is not listed as denied, it is simply absent. So unlike
-    AWS, where organizations:ListAccounts names every account in the org whether
-    or not it can be assumed into, this call cannot on its own tell a complete
-    scan from a half-granted one. Left alone it would report
-    "3 total, 3 scanned, 0 failed" for a tenant of two hundred.
+    assignment reaches is not listed as denied, it is simply absent. So this
+    call cannot on its own tell a complete scan from a half-granted one: left
+    alone it would report "3 total, 3 scanned, 0 failed" for a tenant of two
+    hundred, which is indistinguishable from a healthy three-subscription
+    tenant.
 
     The management group hierarchy is the denominator, because it lists
     subscriptions by membership rather than by access. Anything in it that
@@ -1027,16 +1028,15 @@ def list_subscriptions(client, tenant, management_group, include, exclude,
 
 
 # ── Reader access setup (--setup-role) ────────────────────────────────────────
-# The Azure counterpart of the AWS edition's CloudFormation StackSet. Same
-# contract: grant the access the scan needs, scan, then always take it away
-# again — including when the scan fails.
+# Grant the access the scan needs, scan, then always take it away again —
+# including when the scan fails.
 #
-# It is a far smaller thing than the AWS one, because Azure RBAC inherits. AWS
-# has to deploy a role into every member account and tear N of them down again;
-# here a single assignment at a tenant root management group covers every
-# subscription beneath it, present and future. One PUT, one DELETE.
+# Because Azure RBAC inherits, this is one PUT and one DELETE however large the
+# tenant: a single assignment at a tenant root management group covers every
+# subscription beneath it, present and future. No per-subscription provisioning,
+# and nothing left behind to clean up by hand.
 #
-# This is also the only part of the tool that writes anything.
+# This is the only part of the tool that writes anything.
 
 
 def _token_claims(token):
@@ -1087,8 +1087,7 @@ def grant_reader(client, scope, principal):
     Returns True if this call created the assignment, False if an equivalent one
     was already there. The distinction is load-bearing: teardown removes only
     what this run created, so a standing grant that happens to match is never
-    revoked out from under the customer. (The AWS edition is less careful here —
-    it deletes the StackSet even when it reused a pre-existing one.)
+    revoked out from under the customer.
     """
     name = str(uuid.uuid5(ASSIGNMENT_NAMESPACE, f"{scope}|{principal}"))
     body = {"properties": {
@@ -1271,7 +1270,7 @@ def main():
     # --setup-role is the only path in this tool that writes anything. Whatever
     # happens afterwards — a failed scan, an interrupt, an unwritable --output —
     # the assignment it created has to come back off, so the scan runs inside a
-    # try/finally exactly the way the AWS edition's StackSet does. sys.exit
+    # try/finally around the whole scan. sys.exit
     # raises SystemExit, which a finally still runs on, so even the early exits
     # clean up after themselves.
     granted = []
@@ -1471,7 +1470,7 @@ def run_scan(client, args, include, exclude, interrupt_signal, tenant_hint=None)
         log("identity can see, which may be less than the tenant contains. The summary")
         log("record carries scope_verified=false so the file says so too.")
 
-    # Conventional 128+signal, matching the AWS edition, so a wrapper can tell
+    # Conventional 128+signal, so a supervising script can tell
     # an interrupted run from a complete one. The results written above are
     # still valid — just partial.
     if interrupted:

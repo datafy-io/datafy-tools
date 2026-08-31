@@ -1,7 +1,7 @@
-# --management-group narrows to a subtree of the management group hierarchy —
-# the Azure analogue of the AWS edition's --ou. /descendants walks the whole
-# subtree, so a nested group's subscriptions are included, which is what an
-# operator naming their top-level "Production" group means.
+# --management-group narrows to a subtree of the management group hierarchy.
+# /descendants walks the whole subtree, so a nested group's subscriptions are
+# included, which is what an operator naming their top-level "Production" group
+# means.
 
 setup_sandbox
 

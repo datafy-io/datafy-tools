@@ -44,8 +44,8 @@ assert_not_empty "$(record_for $sub | jq -r '.errors[] | select(test("Microsoft.
 assert_not_empty "$(record_for $sub | jq -r '.errors[] | select(test("TooManyRequests|Http429"))')" \
   "carrying the Azure error code, so throttling is distinguishable from a denial"
 
-# AZURE_MAX_ATTEMPTS counts total attempts, the first one included — the same
-# contract as AWS_MAX_ATTEMPTS in the AWS edition, and the reason azure-core's
-# retry_total is not passed through raw.
+# AZURE_MAX_ATTEMPTS counts total attempts, the first one included, which is why
+# azure-core's retry_total — which counts retries — is converted rather than
+# passed through raw.
 assert_equals 3 "$(fake_calls_for 'Microsoft.Compute/disks')" \
   "AZURE_MAX_ATTEMPTS=3 means three attempts in total, not three retries"

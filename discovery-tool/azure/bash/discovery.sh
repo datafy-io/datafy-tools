@@ -552,10 +552,10 @@ scan_backup() {
 
 # Collect all discovery data for one subscription, writing its record to stdout.
 #
-# Azure differs from AWS in where a failure lands. ARM list calls are scoped to a
-# subscription and return every region at once, so a denied read costs a whole
-# subscription rather than one region — which is why the record is per
-# subscription, and why each resource carries its own location.
+# ARM list calls are scoped to a subscription and return every region at once, so
+# a denied read costs a whole subscription rather than one region. That is why
+# the record is per subscription, and why each resource carries its own
+# location.
 scan_subscription() {
   local sub="$1" name="$2" state="$3" tenant_id="$4" dir="$5"
   local base="/subscriptions/${sub}/providers"
@@ -677,10 +677,10 @@ management_group_subscriptions() {
 #
 # The hard part in Azure is the denominator. GET /subscriptions returns only the
 # subscriptions the identity can already see — a subscription no role assignment
-# reaches is not listed as denied, it is simply absent. So unlike AWS, where
-# organizations:ListAccounts names every account whether or not it can be
-# assumed into, this call cannot on its own tell a complete scan from a
-# half-granted one.
+# reaches is not listed as denied, it is simply absent. So this call cannot on
+# its own tell a complete scan from a half-granted one: left alone it would
+# report a tenant of two hundred as three subscriptions, indistinguishable from
+# a healthy three-subscription tenant.
 #
 # The management group hierarchy is the denominator, because it lists
 # subscriptions by membership rather than by access.
@@ -830,13 +830,13 @@ _token_claim() {
 }
 
 # ── Reader access setup (--setup-role) ────────────────────────────────────────
-# The Azure counterpart of the AWS edition's CloudFormation StackSet. Same
-# contract: grant the access the scan needs, scan, then always take it away
-# again — including when the scan fails.
+# Grant the access the scan needs, scan, then always take it away again —
+# including when the scan fails.
 #
-# One PUT and one DELETE, rather than N stack instances, because Azure RBAC
-# inherits down the management group hierarchy. This is the only part of the
-# tool that writes anything.
+# Because Azure RBAC inherits, this is one PUT and one DELETE however large the
+# tenant: a single assignment at a tenant root management group covers every
+# subscription beneath it. This is the only part of the tool that writes
+# anything.
 
 GRANTED_SCOPES=()
 GRANTED_PRINCIPAL=""

@@ -1,9 +1,9 @@
-# --setup-role: the Azure counterpart of the AWS edition's StackSet.
+# --setup-role: grant the access the scan needs, scan, then always take it away
+# again.
 #
-# Same contract — grant the access the scan needs, scan, then always take it
-# away again — but a much smaller thing, because Azure RBAC inherits. AWS has to
-# deploy a role into every member account; here one assignment at a tenant root
-# management group covers every subscription beneath it.
+# Because Azure RBAC inherits, that is one assignment at a tenant root
+# management group covering every subscription beneath it — however large the
+# tenant, one grant and one revoke.
 #
 # The tenant below has four subscriptions and the identity can initially see
 # none of them, so the flag either works or the run comes back empty. That is
@@ -60,7 +60,7 @@ assert_log_has "$TEST_PRINCIPAL_ID" \
 assert_log_has "/providers/Microsoft.Management/managementGroups/11111111-1111-1111-1111-111111111111" \
   "the grant is made at the tenant root management group, not per subscription"
 
-# One assignment for the whole tenant — the reason this is not a StackSet.
+# One assignment for the whole tenant, however many subscriptions it holds.
 assert_equals 1 "$(fake_calls_for 'roleAssignments/write')" \
   "one assignment covered the entire tenant"
 
