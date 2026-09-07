@@ -58,7 +58,7 @@ try:
         UserAgentPolicy,
     )
     from azure.core.rest import HttpRequest
-    from azure.identity import DefaultAzureCredential
+    from azure.identity import AzureCliCredential, ChainedTokenCredential, DefaultAzureCredential
 except ImportError:                                  # pragma: no cover — install hint
     print(
         "Error: the Azure SDK is not installed.\n\n"
@@ -256,11 +256,17 @@ def build_credential(tenant_id):
         return StaticTokenCredential(token)
     kwargs = {}
     if tenant_id:
-        # Both spellings matter: the first steers the interactive and CLI
-        # credentials, the second steers the shared-cache one.
         kwargs["interactive_browser_tenant_id"] = tenant_id
         kwargs["shared_cache_tenant_id"]        = tenant_id
         kwargs["visual_studio_code_tenant_id"]  = tenant_id
+        kwargs["workload_identity_tenant_id"]   = tenant_id
+        # DefaultAzureCredential has no azure_cli_tenant_id, so the CLI
+        # credential cannot be steered through it and signs in against the
+        # CLI's default tenant instead. Chain an explicitly-tenanted one ahead.
+        return ChainedTokenCredential(
+            AzureCliCredential(tenant_id=tenant_id),
+            DefaultAzureCredential(**kwargs),
+        )
     return DefaultAzureCredential(**kwargs)
 
 
