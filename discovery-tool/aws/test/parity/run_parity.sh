@@ -232,6 +232,47 @@ else
   done
 fi
 
+# ── The role template ──────────────────────────────────────────────────────────
+# All three deploy the same CloudFormation template with --setup-role, so all
+# three have to print the same bytes. They did not: the Python one carried a
+# different Description and an extra parameter description, which nothing
+# compared and nobody noticed. (DT-11548)
+echo
+echo "Comparing the --setup-role role template..."
+
+template_of() {
+  case "$1" in
+    bash)   bash "$ROOT/bash/discovery.sh" --print-role-template ;;
+    python) python3 "$ROOT/python/discovery.py" --print-role-template ;;
+    go)     "$WORK/discovery-go" --print-role-template ;;
+  esac
+}
+
+TEMPLATE_IMPLS=()
+for impl in "${IMPLS[@]}"; do
+  if template_of "$impl" > "$WORK/${impl}.template.json" 2>"$WORK/${impl}.template.err"; then
+    if jq -e . "$WORK/${impl}.template.json" >/dev/null 2>&1; then
+      TEMPLATE_IMPLS+=("$impl")
+    else
+      fail "$impl: --print-role-template emits valid JSON" "$(head -2 "$WORK/${impl}.template.err")"
+    fi
+  else
+    fail "$impl: --print-role-template exits 0" "$(head -2 "$WORK/${impl}.template.err")"
+  fi
+done
+
+if [[ ${#TEMPLATE_IMPLS[@]} -ge 2 ]]; then
+  TBASE="${TEMPLATE_IMPLS[0]}"
+  for impl in "${TEMPLATE_IMPLS[@]:1}"; do
+    if diff -u "$WORK/${TBASE}.template.json" "$WORK/${impl}.template.json" > "$WORK/${impl}.template.diff" 2>&1; then
+      pass "$impl: role template matches $TBASE byte for byte"
+    else
+      fail "$impl: role template matches $TBASE byte for byte" \
+        "$(head -15 "$WORK/${impl}.template.diff" | sed 's/^/      /')"
+    fi
+  done
+fi
+
 echo
 echo "─────────────────────────────────────"
 if [[ "$FAILURES" -eq 0 ]]; then

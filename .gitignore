@@ -1,3 +1,9 @@
-discovery-tool/golang/discovery
-discovery-tool/golang/discovery-*
-discovery-tool/golang/scoping-tool
+discovery-tool/aws/golang/discovery
+discovery-tool/aws/golang/discovery-*
+discovery-tool/aws/golang/scoping-tool
+discovery-tool/azure/golang/discovery
+discovery-tool/azure/golang/discovery-*
+
+# Python bytecode caches — py_compile and the test suite both leave these.
+__pycache__/
+*.pyc

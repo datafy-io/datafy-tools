@@ -35,7 +35,7 @@ from botocore.config import Config
 from botocore.exceptions import ClientError, NoCredentialsError, PartialCredentialsError
 
 # ── Configuration ──────────────────────────────────────────────────────────────
-VERSION             = "0.2.0"
+VERSION             = "0.2.1"
 DEFAULT_ROLE_NAME   = "OrganizationAccountAccessRole"
 DISCOVERY_ROLE_NAME = "DatafyDiscoveryRole"
 STACKSET_NAME       = "DatafyDiscovery"
@@ -72,9 +72,11 @@ BOTO_CONFIG = Config(retries={"mode": RETRY_MODE, "total_max_attempts": RETRY_MA
 # Grants only the describe/list permissions this script actually calls.
 DISCOVERY_ROLE_TEMPLATE = json.dumps({
     "AWSTemplateFormatVersion": "2010-09-09",
+    # Worded without naming an implementation: all three deploy this same
+    # template, and the parity harness holds them to it byte for byte.
     "Description": (
         "Datafy Discovery Role — minimal read-only role for EBS/EC2 inventory. "
-        "Created by discovery.py and auto-deleted after the scan."
+        "Created by the Datafy discovery tool and auto-deleted after the scan."
     ),
     "Parameters": {
         "ManagementAccountId": {
@@ -114,16 +116,24 @@ DISCOVERY_ROLE_TEMPLATE = json.dumps({
                                     "ec2:DescribeSnapshots",
                                 ],
                             },
+                            # dlm:GetLifecyclePolicies and backup:ListBackupPlans are
+                            # List-level actions: AWS defines no resource type for
+                            # either, so the Resource element must be "*". Scoping
+                            # them to arn:aws:dlm:*:*:policy/* and
+                            # arn:aws:backup:*:*:backup-plan:* — which an earlier
+                            # least-privilege pass did — is not a tighter grant, it
+                            # is a grant that never matches, and both calls then fail
+                            # on every account. (DT-11548)
                             {
                                 "Sid": "DLMPoliciesReadOnly",
                                 "Effect": "Allow",
-                                "Resource": "arn:aws:dlm:*:*:policy/*",
+                                "Resource": "*",
                                 "Action": ["dlm:GetLifecyclePolicies"],
                             },
                             {
                                 "Sid": "BackupPlansReadOnly",
                                 "Effect": "Allow",
-                                "Resource": "arn:aws:backup:*:*:backup-plan:*",
+                                "Resource": "*",
                                 "Action": ["backup:ListBackupPlans"],
                             },
                         ],
@@ -562,6 +572,14 @@ def main():
     )
     parser.add_argument("--version", action="version", version=f"Datafy Discovery Tool v{VERSION}")
     parser.add_argument(
+        "--print-role-template", action="store_true",
+        help=(
+            "Print the CloudFormation template --setup-role would deploy, and exit. "
+            "Nothing is contacted and nothing is deployed — this is for reviewing "
+            "exactly what would be created before allowing it."
+        ),
+    )
+    parser.add_argument(
         "--setup-role", action="store_true",
         help=(
             "Deploy a minimal read-only IAM role to child accounts via CloudFormation StackSet. "
@@ -581,6 +599,15 @@ def main():
     parser.add_argument("--output",  metavar="FILE",        help="Output file path (default: discovery_<timestamp>.jsonl)")
     parser.add_argument("--profile", metavar="PROFILE",     help="AWS profile to use (from ~/.aws/config)")
     args = parser.parse_args()
+
+    # Reviewing the template is the whole point of this flag, so it goes to
+    # stdout where it can be piped or redirected — the same exception --version
+    # gets. Normalised through json so all three implementations print the same
+    # bytes; the parity harness checks that they do.
+    if args.print_role_template:
+        print(json.dumps(json.loads(DISCOVERY_ROLE_TEMPLATE), indent=2, sort_keys=True,
+                         ensure_ascii=False))
+        return
 
     # Route SIGTERM through the same path as Ctrl+C, so a run killed by a
     # timeout or a supervisor still writes out what it has collected.

@@ -45,7 +45,7 @@ import (
 // ── Constants ──────────────────────────────────────────────────────────────────
 
 const (
-	version           = "0.2.0"
+	version           = "0.2.1"
 	defaultRoleName   = "OrganizationAccountAccessRole"
 	discoveryRoleName = "DatafyDiscoveryRole"
 	stackSetName      = "DatafyDiscovery"
@@ -70,13 +70,18 @@ const (
 	defaultRetryMaxAttempts = 10
 )
 
-// IAM role CloudFormation template deployed to each child account.
-// Grants only the permissions this tool actually calls.
+// The IAM role template deployed to each child account, granting only the
+// describe/list permissions this tool actually calls.
+//
+// dlm:GetLifecyclePolicies and backup:ListBackupPlans are granted on "*" and
+// must stay that way: AWS defines no resource type for either, so a Resource
+// element naming an ARN pattern is not a tighter grant, it is one that never
+// matches — and both calls then fail on every account. (DT-11548)
 const discoveryRoleTemplate = `{
   "AWSTemplateFormatVersion": "2010-09-09",
-  "Description": "Datafy Discovery Role — minimal read-only role for EBS/EC2 inventory. Auto-deleted after scan.",
+  "Description": "Datafy Discovery Role — minimal read-only role for EBS/EC2 inventory. Created by the Datafy discovery tool and auto-deleted after the scan.",
   "Parameters": {
-    "ManagementAccountId": { "Type": "String" }
+    "ManagementAccountId": { "Type": "String", "Description": "Management account ID that is allowed to assume this role" }
   },
   "Resources": {
     "DatafyDiscoveryRole": {
@@ -104,13 +109,13 @@ const discoveryRoleTemplate = `{
             {
               "Sid": "DLMPoliciesReadOnly",
               "Effect": "Allow",
-              "Resource": "arn:aws:dlm:*:*:policy/*",
+              "Resource": "*",
               "Action": ["dlm:GetLifecyclePolicies"]
             },
             {
               "Sid": "BackupPlansReadOnly",
               "Effect": "Allow",
-              "Resource": "arn:aws:backup:*:*:backup-plan:*",
+              "Resource": "*",
               "Action": ["backup:ListBackupPlans"]
             }
           ]
@@ -832,6 +837,8 @@ func teardownStackSet(ctx context.Context, cfg aws.Config, ou string, include []
 
 func main() {
 	versionFlag := flag.Bool("version", false, "Show version")
+	printTemplateFlag := flag.Bool("print-role-template", false,
+		"Print the CloudFormation template --setup-role would deploy, and exit")
 	profileFlag := flag.String("profile", "", "AWS named profile (~/.aws/config)")
 	roleFlag := flag.String("role", defaultRoleName, "IAM role to assume in child accounts")
 	setupRoleFlag := flag.Bool("setup-role", false, "Deploy read-only role via StackSet; auto-removed after scan")
@@ -843,6 +850,26 @@ func main() {
 
 	if *versionFlag {
 		fmt.Printf("Datafy Discovery Tool v%s\n", version)
+		os.Exit(0)
+	}
+
+	// Reviewing the template is the whole point of this flag, so it goes to
+	// stdout where it can be piped or redirected — the same exception --version
+	// gets. Round-tripped through encoding/json so all three implementations
+	// print the same bytes; the parity harness checks that they do. Go marshals
+	// map keys in sorted order, which is what makes that possible.
+	if *printTemplateFlag {
+		var doc any
+		if err := json.Unmarshal([]byte(discoveryRoleTemplate), &doc); err != nil {
+			fmt.Fprintf(os.Stderr, "Error: the embedded role template is not valid JSON: %v\n", err)
+			os.Exit(1)
+		}
+		out, err := json.MarshalIndent(doc, "", "  ")
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error: could not render the role template: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Println(string(out))
 		os.Exit(0)
 	}
 
