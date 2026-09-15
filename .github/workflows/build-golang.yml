@@ -2,7 +2,7 @@ name: Build and Release
 
 on:
   push:
-    branches: [main]
+    branches: [master]
     paths:
       - "discovery-tool/**"
     tags:
@@ -29,34 +29,71 @@ jobs:
             goarch: arm64
           - goos: windows
             goarch: amd64
+          - goos: windows
+            goarch: arm64
 
     steps:
       - uses: actions/checkout@v4
 
       - uses: actions/setup-go@v5
         with:
-          go-version-file: discovery-tool/golang/go.mod
-          cache-dependency-path: discovery-tool/golang/go.sum
+          go-version-file: discovery-tool/aws/golang/go.mod
+          cache-dependency-path: |
+            discovery-tool/aws/golang/go.sum
+            discovery-tool/azure/golang/go.sum
 
-      - name: Download modules
-        working-directory: discovery-tool/golang
+      # Both editions ship a Go binary, built from the same matrix so a platform
+      # is either covered for both clouds or for neither.
+      - name: Download modules (AWS)
+        working-directory: discovery-tool/aws/golang
         run: go mod tidy
 
-      - name: Build
-        working-directory: discovery-tool/golang
+      - name: Download modules (Azure)
+        working-directory: discovery-tool/azure/golang
+        run: go mod tidy
+
+      - name: Build (AWS)
+        working-directory: discovery-tool/aws/golang
         env:
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
           CGO_ENABLED: "0"
         run: |
-          BIN=discovery-${{ matrix.goos }}-${{ matrix.goarch }}
+          BIN=discovery-aws-${{ matrix.goos }}-${{ matrix.goarch }}
           [ "${{ matrix.goos }}" = "windows" ] && BIN="${BIN}.exe"
           go build -ldflags="-s -w" -o "${BIN}" .
+
+      - name: Build (Azure)
+        working-directory: discovery-tool/azure/golang
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: "0"
+        run: |
+          BIN=discovery-azure-${{ matrix.goos }}-${{ matrix.goarch }}
+          [ "${{ matrix.goos }}" = "windows" ] && BIN="${BIN}.exe"
+          go build -ldflags="-s -w" -o "${BIN}" .
+
+      - name: Vet (Azure)
+        working-directory: discovery-tool/azure/golang
+        run: go vet ./...
+
+      # Collected into one directory before upload. upload-artifact roots the
+      # archive at the least common ancestor of the paths it matches, so listing
+      # the two golang directories directly would nest the binaries under
+      # aws/golang/ and azure/golang/ inside the artifact — and the release
+      # job's artifacts/discovery-* glob would then match none of them.
+      - name: Collect binaries
+        run: |
+          mkdir -p dist
+          cp discovery-tool/aws/golang/discovery-aws-*     dist/
+          cp discovery-tool/azure/golang/discovery-azure-* dist/
+          ls -l dist
 
       - uses: actions/upload-artifact@v4
         with:
           name: discovery-${{ matrix.goos }}-${{ matrix.goarch }}
-          path: discovery-tool/golang/discovery-*
+          path: dist/discovery-*
           if-no-files-found: error
 
   release:
@@ -77,47 +114,118 @@ jobs:
 
       - name: Stage release assets
         run: |
-          cp discovery-tool/bash/discovery.sh    artifacts/discovery.sh
-          cp discovery-tool/python/discovery.py  artifacts/discovery.py
+          cp discovery-tool/aws/bash/discovery.sh      artifacts/discovery-aws.sh
+          cp discovery-tool/aws/python/discovery.py    artifacts/discovery-aws.py
+          cp discovery-tool/azure/bash/discovery.sh    artifacts/discovery-azure.sh
+          cp discovery-tool/azure/python/discovery.py  artifacts/discovery-azure.py
+
+      # A release missing an asset still publishes successfully and simply has a
+      # dead download link, which is only noticed by whoever tries to use it.
+      # Every file the release notes advertise is checked to exist first.
+      - name: Verify every advertised asset is present
+        run: |
+          missing=0
+          for cloud in aws azure; do
+            for target in linux-amd64 linux-arm64 darwin-amd64 darwin-arm64 windows-amd64.exe windows-arm64.exe; do
+              f="artifacts/discovery-${cloud}-${target}"
+              [ -f "$f" ] || { echo "missing: $f"; missing=1; }
+            done
+            for ext in sh py; do
+              f="artifacts/discovery-${cloud}.${ext}"
+              [ -f "$f" ] || { echo "missing: $f"; missing=1; }
+            done
+          done
+          echo "--- staged assets ---"
+          ls -l artifacts
+          if [ "$missing" -ne 0 ]; then
+            echo "Refusing to publish an incomplete release." >&2
+            exit 1
+          fi
 
       - name: Create GitHub release
         uses: softprops/action-gh-release@v2
         with:
           files: |
             artifacts/discovery-*
-            artifacts/discovery.sh
-            artifacts/discovery.py
           generate_release_notes: true
           body: |
             ## Datafy Discovery Tool ${{ github.ref_name }}
 
-            Inventories EBS volumes, EC2 instances, AMIs, snapshots, DLM policies, and AWS Backup plans across all accounts in an AWS Organization. Output is one JSON object per account × region (JSONL format).
+            Inventories the block storage and compute footprint of a cloud estate, so a Datafy engagement can be scoped before installation. Output is one JSON object per unit of scope (JSONL format).
 
-            ## Download
+            **AWS** — EBS volumes, EC2 instances, AMIs, snapshots, DLM policies and AWS Backup plans, across every account in an Organization. One record per account × region.
+
+            **Azure** — managed disks, VMs, scale sets, snapshots, images, backup vaults and policies, across every subscription in a tenant. One record per subscription.
+
+            Assets are named by cloud: `discovery-aws-*` / `discovery-azure-*` for the Go binaries, and `discovery-aws.{sh,py}` / `discovery-azure.{sh,py}` for the script implementations.
+
+            ## Download — AWS
 
             | Tool | File | Requirements |
             |------|------|--------------|
-            | Go — Linux x86-64 | `discovery-linux-amd64` | none |
-            | Go — Linux ARM64 | `discovery-linux-arm64` | none |
-            | Go — macOS x86-64 | `discovery-darwin-amd64` | none |
-            | Go — macOS Apple Silicon | `discovery-darwin-arm64` | none |
-            | Go — Windows x86-64 | `discovery-windows-amd64.exe` | none |
-            | Bash | `discovery.sh` | aws-cli v2, jq |
-            | Python | `discovery.py` | Python 3.8+, boto3 |
+            | Go — Linux x86-64 | `discovery-aws-linux-amd64` | none |
+            | Go — Linux ARM64 | `discovery-aws-linux-arm64` | none |
+            | Go — macOS x86-64 | `discovery-aws-darwin-amd64` | none |
+            | Go — macOS Apple Silicon | `discovery-aws-darwin-arm64` | none |
+            | Go — Windows x86-64 | `discovery-aws-windows-amd64.exe` | none |
+            | Go — Windows ARM64 | `discovery-aws-windows-arm64.exe` | none |
+            | Bash | `discovery-aws.sh` | aws-cli v2, jq |
+            | Python | `discovery-aws.py` | Python 3.8+, boto3 |
 
-            ## Quick start
+            ## Download — Azure
+
+            | Tool | File | Requirements |
+            |------|------|--------------|
+            | Go — Linux x86-64 | `discovery-azure-linux-amd64` | none |
+            | Go — Linux ARM64 | `discovery-azure-linux-arm64` | none |
+            | Go — macOS x86-64 | `discovery-azure-darwin-amd64` | none |
+            | Go — macOS Apple Silicon | `discovery-azure-darwin-arm64` | none |
+            | Go — Windows x86-64 | `discovery-azure-windows-amd64.exe` | none |
+            | Go — Windows ARM64 | `discovery-azure-windows-arm64.exe` | none |
+            | Bash | `discovery-azure.sh` | curl, jq |
+            | Python | `discovery-azure.py` | Python 3.9+, azure-identity |
+
+            ## Quick start — AWS
+
+            Run from the management (root) account.
 
             ```bash
             # Go
-            ./discovery-darwin-arm64 --profile myprofile --setup-role
+            chmod +x discovery-aws-darwin-arm64
+            ./discovery-aws-darwin-arm64 --profile myprofile --setup-role
 
             # Bash
-            chmod +x discovery.sh
-            ./discovery.sh --profile myprofile --setup-role
+            chmod +x discovery-aws.sh
+            ./discovery-aws.sh --profile myprofile --setup-role
 
             # Python
             pip install boto3
-            python3 discovery.py --profile myprofile --setup-role
+            python3 discovery-aws.py --profile myprofile --setup-role
             ```
 
-            See the [README](https://github.com/datafy-io/datafy-tools/blob/main/discovery-tool/README.md) for full usage.
+            ## Quick start — Azure
+
+            Sign in first with `az login`. There is no role to assume: one
+            identity with Reader across the tenant reads every subscription.
+
+            ```bash
+            # Go
+            chmod +x discovery-azure-darwin-arm64
+            ./discovery-azure-darwin-arm64
+
+            # Bash
+            chmod +x discovery-azure.sh
+            ./discovery-azure.sh
+
+            # Python
+            pip install azure-identity
+            python3 discovery-azure.py
+            ```
+
+            Add `--setup-role` to have the tool grant itself Reader for the
+            duration of the scan and remove it afterwards.
+
+            See the [overview](https://github.com/datafy-io/datafy-tools/blob/master/discovery-tool/README.md),
+            the [AWS guide](https://github.com/datafy-io/datafy-tools/blob/master/discovery-tool/aws/README.md)
+            or the [Azure guide](https://github.com/datafy-io/datafy-tools/blob/master/discovery-tool/azure/README.md)
+            for full usage.

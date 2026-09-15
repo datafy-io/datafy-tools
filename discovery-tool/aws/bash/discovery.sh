@@ -25,7 +25,7 @@ export AWS_MAX_ATTEMPTS="${AWS_MAX_ATTEMPTS:-10}"
 
 # ── Constants ──────────────────────────────────────────────────────────────────
 
-VERSION="0.2.0"
+VERSION="0.2.1"
 DEFAULT_ROLE="OrganizationAccountAccessRole"
 DISCOVERY_ROLE="DatafyDiscoveryRole"
 STACKSET_NAME="DatafyDiscovery"
@@ -37,11 +37,18 @@ MAX_REGION_JOBS=4
 # exec argument list, so the lookup is split into batches of this size.
 AMI_BATCH_SIZE=100
 
+# The IAM role template deployed to each child account, granting only the
+# describe/list permissions this tool actually calls.
+#
+# dlm:GetLifecyclePolicies and backup:ListBackupPlans are granted on "*" and
+# must stay that way: AWS defines no resource type for either, so a Resource
+# element naming an ARN pattern is not a tighter grant, it is one that never
+# matches — and both calls then fail on every account. (DT-11548)
 DISCOVERY_ROLE_TEMPLATE='{
   "AWSTemplateFormatVersion": "2010-09-09",
-  "Description": "Datafy Discovery Role — minimal read-only role for EBS/EC2 inventory. Auto-deleted after scan.",
+  "Description": "Datafy Discovery Role — minimal read-only role for EBS/EC2 inventory. Created by the Datafy discovery tool and auto-deleted after the scan.",
   "Parameters": {
-    "ManagementAccountId": { "Type": "String" }
+    "ManagementAccountId": { "Type": "String", "Description": "Management account ID that is allowed to assume this role" }
   },
   "Resources": {
     "DatafyDiscoveryRole": {
@@ -69,13 +76,13 @@ DISCOVERY_ROLE_TEMPLATE='{
             {
               "Sid": "DLMPoliciesReadOnly",
               "Effect": "Allow",
-              "Resource": "arn:aws:dlm:*:*:policy/*",
+              "Resource": "*",
               "Action": ["dlm:GetLifecyclePolicies"]
             },
             {
               "Sid": "BackupPlansReadOnly",
               "Effect": "Allow",
-              "Resource": "arn:aws:backup:*:*:backup-plan:*",
+              "Resource": "*",
               "Action": ["backup:ListBackupPlans"]
             }
           ]
@@ -743,6 +750,14 @@ while [[ $# -gt 0 ]]; do
     --exclude)    EXCLUDE="$2";     shift 2 ;;
     --output)     OUTPUT="$2";      shift 2 ;;
     --version)    echo "Datafy Discovery Tool v${VERSION}"; exit 0 ;;
+    # Reviewing the template is the whole point of this flag, so it goes to
+    # stdout where it can be piped or redirected — the same exception --version
+    # gets. jq -S sorts keys, so all three implementations print the same bytes;
+    # the parity harness checks that they do.
+    --print-role-template)
+                  printf '%s\n' "$DISCOVERY_ROLE_TEMPLATE" | jq -S . || {
+                    echo "Error: the embedded role template is not valid JSON." >&2; exit 1; }
+                  exit 0 ;;
     --help|-h)    usage ;;
     *) fail "Unknown option: $1" ;;
   esac
