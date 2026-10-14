@@ -54,6 +54,7 @@ API_DISKS="${AZURE_API_DISKS:-2023-04-02}"
 API_SNAPSHOTS="${AZURE_API_SNAPSHOTS:-2023-04-02}"
 API_VIRTUAL_MACHINES="${AZURE_API_VIRTUAL_MACHINES:-2023-09-01}"
 API_SCALE_SETS="${AZURE_API_SCALE_SETS:-2023-09-01}"
+API_SCALE_SET_VMS="${AZURE_API_SCALE_SET_VMS:-2023-09-01}"
 API_IMAGES="${AZURE_API_IMAGES:-2023-09-01}"
 API_RSV_VAULTS="${AZURE_API_RSV_VAULTS:-2023-04-01}"
 API_RSV_POLICIES="${AZURE_API_RSV_POLICIES:-2023-02-01}"
@@ -368,6 +369,65 @@ SHAPE_SCALE_SETS='map({
       lun: .lun, size_gb: .diskSizeGB, caching: .caching,
       storage_account_type: .managedDisk.storageAccountType
     } ],
+  priority: .properties.virtualMachineProfile.priority,
+  image_reference: (if (.properties.virtualMachineProfile.storageProfile.imageReference // null) == null then null else {
+      publisher: .properties.virtualMachineProfile.storageProfile.imageReference.publisher,
+      offer: .properties.virtualMachineProfile.storageProfile.imageReference.offer,
+      sku: .properties.virtualMachineProfile.storageProfile.imageReference.sku,
+      version: .properties.virtualMachineProfile.storageProfile.imageReference.version,
+      exact_version: .properties.virtualMachineProfile.storageProfile.imageReference.exactVersion,
+      id: .properties.virtualMachineProfile.storageProfile.imageReference.id,
+      shared_gallery_image_id: .properties.virtualMachineProfile.storageProfile.imageReference.sharedGalleryImageId,
+      community_gallery_image_id: .properties.virtualMachineProfile.storageProfile.imageReference.communityGalleryImageId
+    } end),
+  aks_pool: (.tags["aks-managed-poolName"]? // null),
+  tags: (.tags // {})
+})'
+
+# One instance of a scale set, with the owning scale set passed in as $set.
+# Same fields as a virtual_machines entry so the two read the same way.
+SHAPE_SCALE_SET_INSTANCES='map({
+  id: .id, name: .name, resource_group: (.id | rgof), location: .location,
+  zones: (.zones // []),
+  instance_id: .instanceId,
+  vm_id: .properties.vmId,
+  computer_name: .properties.osProfile.computerName,
+  vm_size: .sku.name,
+  provisioning_state: .properties.provisioningState,
+  power_state: (.properties | powerstate),
+  latest_model_applied: .properties.latestModelApplied,
+  os_type: .properties.storageProfile.osDisk.osType,
+  priority: $set.properties.virtualMachineProfile.priority,
+  scale_set_id: $set.id,
+  scale_set_name: $set.name,
+  aks_pool: ($set.tags["aks-managed-poolName"]? // null),
+  os_disk: (if (.properties.storageProfile.osDisk // null) == null then null else {
+      name: .properties.storageProfile.osDisk.name,
+      os_type: .properties.storageProfile.osDisk.osType,
+      size_gb: .properties.storageProfile.osDisk.diskSizeGB,
+      caching: .properties.storageProfile.osDisk.caching,
+      create_option: .properties.storageProfile.osDisk.createOption,
+      managed_disk_id: .properties.storageProfile.osDisk.managedDisk.id,
+      storage_account_type: .properties.storageProfile.osDisk.managedDisk.storageAccountType,
+      vhd_uri: .properties.storageProfile.osDisk.vhd.uri
+    } end),
+  data_disks: [ (.properties.storageProfile.dataDisks // [])[] | {
+      lun: .lun, name: .name, size_gb: .diskSizeGB, caching: .caching,
+      create_option: .createOption,
+      managed_disk_id: .managedDisk.id,
+      storage_account_type: .managedDisk.storageAccountType,
+      vhd_uri: .vhd.uri
+    } ],
+  image_reference: (if (.properties.storageProfile.imageReference // null) == null then null else {
+      publisher: .properties.storageProfile.imageReference.publisher,
+      offer: .properties.storageProfile.imageReference.offer,
+      sku: .properties.storageProfile.imageReference.sku,
+      version: .properties.storageProfile.imageReference.version,
+      exact_version: .properties.storageProfile.imageReference.exactVersion,
+      id: .properties.storageProfile.imageReference.id,
+      shared_gallery_image_id: .properties.storageProfile.imageReference.sharedGalleryImageId,
+      community_gallery_image_id: .properties.storageProfile.imageReference.communityGalleryImageId
+    } end),
   tags: (.tags // {})
 })'
 
@@ -399,6 +459,8 @@ SHAPE_IMAGES='map({
 })'
 
 shape() { jq -c "${JQ_PRELUDE} ${1}"; }
+# shape_with_set SET_JSON FILTER — shape stdin with the owning scale set as $set.
+shape_with_set() { jq -c --argjson set "$1" "${JQ_PRELUDE} ${2}"; }
 
 # ── Per-subscription scan ─────────────────────────────────────────────────────
 
@@ -486,6 +548,69 @@ scan_vms() {
   ' > "$dir/virtual_machines.json"
 }
 
+# Scale sets and, for each that can have instances the subscription-wide VM
+# list does not show, the instances.
+#
+# A Uniform scale set's instances are listed only under the scale set, and AKS
+# makes every node one. Flexible instances are ordinary VMs and already in
+# virtual_machines, and a scale set at zero capacity has nothing to list, so
+# neither costs a call. The instance view is expanded inline here — unlike at
+# subscription scope, a scale-set-scoped list honours it — which is what carries
+# each node's power state.
+#
+# A scale set whose instances cannot be read is still reported as a scale set,
+# with the failure recorded against the subscription.
+scan_scale_sets() {
+  local dir="$1" sub="$2"
+  local base="/subscriptions/${sub}/providers"
+  local raw="$dir/scale_sets.raw.json"
+
+  printf 'x\n' >> "$dir/calls"
+  if ! arm_list_to "$raw" "${base}/Microsoft.Compute/virtualMachineScaleSets" "$API_SCALE_SETS"; then
+    printf 'x\n' >> "$dir/failures"
+    printf 'Microsoft.Compute/virtualMachineScaleSets: %s\n' "$ARM_ERROR" >> "$dir/errors"
+    printf '[]' > "$dir/scale_sets.json"
+    printf '[]' > "$dir/scale_set_instances.json"
+    return 0
+  fi
+  shape "$SHAPE_SCALE_SETS" < "$raw" > "$dir/scale_sets.json" 2>/dev/null || printf '[]' > "$dir/scale_sets.json"
+
+  rm -rf "$dir/ssi"; mkdir -p "$dir/ssi"
+  local idx set_rg set_name mode capacity
+  while IFS=$'\t' read -r idx set_rg set_name mode capacity; do
+    [[ -z "$set_rg" || "$set_rg" == "null" || -z "$set_name" || "$set_name" == "null" ]] && continue
+    [[ "$mode" == "flexible" || "$capacity" == "0" ]] && continue
+    wait_for_slot "$MAX_CALL_JOBS"
+    (
+      local path="/subscriptions/${sub}/resourceGroups/${set_rg}/providers/Microsoft.Compute/virtualMachineScaleSets/${set_name}/virtualMachines"
+      local found set_json
+      found="$(mktemp "$TMP/ssi.XXXXXX")"
+      printf 'x\n' >> "$dir/calls"
+      if arm_list_to "$found" "$path" "$API_SCALE_SET_VMS" '$expand=instanceView'; then
+        set_json="$(jq -c ".[$idx]" "$raw")"
+        shape_with_set "$set_json" "$SHAPE_SCALE_SET_INSTANCES" < "$found" > "$dir/ssi/$(printf '%08d' "$idx").json" 2>/dev/null \
+          || rm -f "$dir/ssi/$(printf '%08d' "$idx").json"
+      else
+        printf 'x\n' >> "$dir/failures"
+        printf 'Microsoft.Compute/virtualMachineScaleSets/%s/virtualMachines: %s\n' "$set_name" "$ARM_ERROR" >> "$dir/errors"
+      fi
+      rm -f "$found"
+    ) &
+  done < <(jq -r "${JQ_PRELUDE}"'to_entries[] | [.key, (.value.id | rgof), .value.name,
+                    ((.value.properties.orchestrationMode // "") | ascii_downcase),
+                    (.value.sku.capacity | tostring)] | @tsv' "$raw")
+  wait
+
+  # Per-set files sort by scale-set position, so the order matches the scale
+  # set list and the other two implementations.
+  local files=("$dir"/ssi/*.json)
+  if [[ -e "${files[0]}" ]]; then
+    jq -s -c 'add // []' "${files[@]}" > "$dir/scale_set_instances.json"
+  else
+    printf '[]' > "$dir/scale_set_instances.json"
+  fi
+}
+
 # Vaults and their policies, from both of Azure's backup families.
 #
 # Policies are vault-scoped in ARM — there is no subscription-wide list — so
@@ -570,8 +695,7 @@ scan_subscription() {
     "${base}/Microsoft.Compute/snapshots" "$API_SNAPSHOTS" &
   attempt "$dir" "Microsoft.Compute/images" "$dir/images.json" "$SHAPE_IMAGES" \
     "${base}/Microsoft.Compute/images" "$API_IMAGES" &
-  attempt "$dir" "Microsoft.Compute/virtualMachineScaleSets" "$dir/scale_sets.json" "$SHAPE_SCALE_SETS" \
-    "${base}/Microsoft.Compute/virtualMachineScaleSets" "$API_SCALE_SETS" &
+  scan_scale_sets "$dir" "$sub" &
   scan_vms "$dir" "$sub" &
   scan_backup "$dir" "$sub" &
   wait
@@ -588,7 +712,7 @@ scan_subscription() {
   fi
 
   local f
-  for f in disks virtual_machines scale_sets snapshots images backup_vaults backup_policies; do
+  for f in disks virtual_machines scale_sets scale_set_instances snapshots images backup_vaults backup_policies; do
     [[ -s "$dir/$f.json" ]] || printf '[]' > "$dir/$f.json"
   done
 
@@ -600,6 +724,7 @@ scan_subscription() {
     --slurpfile disks "$dir/disks.json" \
     --slurpfile vms "$dir/virtual_machines.json" \
     --slurpfile scale_sets "$dir/scale_sets.json" \
+    --slurpfile ssi "$dir/scale_set_instances.json" \
     --slurpfile snapshots "$dir/snapshots.json" \
     --slurpfile images "$dir/images.json" \
     --slurpfile vaults "$dir/backup_vaults.json" \
@@ -616,11 +741,12 @@ scan_subscription() {
       scanned_at: $scanned_at,
       errors: ($errors_raw | split("\n") | map(select(length > 0)) | unique),
       locations: ([ ($disks[0] // [])[], ($vms[0] // [])[], ($scale_sets[0] // [])[],
-                    ($snapshots[0] // [])[], ($images[0] // [])[], ($vaults[0] // [])[] ]
+                    ($ssi[0] // [])[], ($snapshots[0] // [])[], ($images[0] // [])[], ($vaults[0] // [])[] ]
                   | map(.location // empty) | unique),
       disks: ($disks[0] // []),
       virtual_machines: ($vms[0] // []),
       scale_sets: ($scale_sets[0] // []),
+      scale_set_instances: ($ssi[0] // []),
       snapshots: ($snapshots[0] // []),
       images: ($images[0] // []),
       backup_vaults: ($vaults[0] // []),
@@ -646,7 +772,7 @@ subscription_record() {
       record_type: "subscription", subscription_id: $sub, subscription_name: $name,
       tenant_id: $tenant, subscription_state: $state, status: $status, reason: $reason,
       scanned_at: $scanned_at, errors: [], locations: [],
-      disks: [], virtual_machines: [], scale_sets: [], snapshots: [], images: [],
+      disks: [], virtual_machines: [], scale_sets: [], scale_set_instances: [], snapshots: [], images: [],
       backup_vaults: [], backup_policies: []
     }'
 }

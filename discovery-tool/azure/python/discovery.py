@@ -117,6 +117,7 @@ API = {
     "snapshots":         _api("snapshots",         "2023-04-02"),
     "virtual_machines":  _api("virtual_machines",  "2023-09-01"),
     "scale_sets":        _api("scale_sets",        "2023-09-01"),
+    "scale_set_vms":     _api("scale_set_vms",     "2023-09-01"),
     "images":            _api("images",            "2023-09-01"),
     "rsv_vaults":        _api("rsv_vaults",        "2023-04-01"),
     "rsv_policies":      _api("rsv_policies",      "2023-02-01"),
@@ -558,7 +559,53 @@ def shape_scale_set(s):
             "caching": dd.get("caching"),
             "storage_account_type": dig(dd, "managedDisk", "storageAccountType"),
         } for dd in (profile.get("dataDisks") or [])],
+        "priority":       dig(props, "virtualMachineProfile", "priority"),
+        "image_reference": _image_reference({"storageProfile": profile}),
+        "aks_pool":       _aks_pool(s),
         "tags":           tags_of(s),
+    }
+
+
+def _aks_pool(r):
+    """The AKS node pool a scale set backs, from the tag AKS puts on every scale
+    set it manages. None for one that is not AKS's, which is how a reader tells
+    a Kubernetes node from any other scale-set instance."""
+    return (r.get("tags") or {}).get("aks-managed-poolName")
+
+
+def shape_scale_set_instance(i, scale_set):
+    """One instance of a scale set.
+
+    A Uniform scale set's instances are not in the subscription's
+    virtualMachines list, so this is the only place they appear — and for AKS,
+    where every node is a Uniform scale-set instance, it is where the nodes are.
+    It carries the same fields as a virtual_machines entry so the two can be
+    read the same way.
+    """
+    props = i.get("properties") or {}
+    set_props = scale_set.get("properties") or {}
+    return {
+        "id":              i.get("id"),
+        "name":            i.get("name"),
+        "resource_group":  resource_group_of(i.get("id")),
+        "location":        i.get("location"),
+        "zones":           i.get("zones") or [],
+        "instance_id":     i.get("instanceId"),
+        "vm_id":           props.get("vmId"),
+        "computer_name":   dig(props, "osProfile", "computerName"),
+        "vm_size":         dig(i, "sku", "name"),
+        "provisioning_state": props.get("provisioningState"),
+        "power_state":     _power_state(props),
+        "latest_model_applied": props.get("latestModelApplied"),
+        "os_type":         dig(props, "storageProfile", "osDisk", "osType"),
+        "priority":        dig(set_props, "virtualMachineProfile", "priority"),
+        "scale_set_id":    scale_set.get("id"),
+        "scale_set_name":  scale_set.get("name"),
+        "aks_pool":        _aks_pool(scale_set),
+        "os_disk":         _os_disk(props),
+        "data_disks":      _data_disks(props),
+        "image_reference": _image_reference(props),
+        "tags":            tags_of(i),
     }
 
 
@@ -664,6 +711,7 @@ def subscription_record(sub, status, reason=None, **extra):
         "disks":             [],
         "virtual_machines":  [],
         "scale_sets":        [],
+        "scale_set_instances": [],
         "snapshots":         [],
         "images":            [],
         "backup_vaults":     [],
@@ -721,8 +769,48 @@ def scan_subscription(client, sub):
         return simple("Microsoft.Compute/images", "Microsoft.Compute/images", "images", shape_image)
 
     def list_scale_sets():
-        return simple("Microsoft.Compute/virtualMachineScaleSets",
-                      "Microsoft.Compute/virtualMachineScaleSets", "scale_sets", shape_scale_set)
+        """Scale sets and, for each that can have instances the subscription-wide
+        VM list does not show, the instances.
+
+        A Uniform scale set's instances are listed only under the scale set, and
+        AKS makes every node one. Flexible instances are ordinary VMs and already
+        in virtual_machines, and a scale set at zero capacity has nothing to
+        list, so neither costs a call. The instance view is expanded inline here
+        — unlike at subscription scope, a scale-set-scoped list honours it —
+        which is what carries each node's power state.
+
+        A scale set whose instances cannot be read is still reported as a scale
+        set, with the failure recorded against the subscription.
+        """
+        raw = attempt(
+            "Microsoft.Compute/virtualMachineScaleSets",
+            lambda: arm_list(client, f"{base}/Microsoft.Compute/virtualMachineScaleSets",
+                             API["scale_sets"]),
+            [],
+        )
+        sets = [shape_scale_set(s) for s in raw]
+
+        def instances_of(s):
+            rg, name = resource_group_of(s.get("id")), s.get("name")
+            capacity = dig(s, "sku", "capacity")
+            mode = dig(s, "properties", "orchestrationMode") or ""
+            if mode.lower() == "flexible" or capacity == 0 or not rg or not name:
+                return []
+            path = (f"/subscriptions/{sub_id}/resourceGroups/{rg}"
+                    f"/providers/Microsoft.Compute/virtualMachineScaleSets/{name}/virtualMachines")
+            found = attempt(
+                f"Microsoft.Compute/virtualMachineScaleSets/{name}/virtualMachines",
+                lambda: arm_list(client, path, API["scale_set_vms"], {"$expand": "instanceView"}),
+                [],
+            )
+            return [shape_scale_set_instance(i, s) for i in found]
+
+        instances = []
+        if raw:
+            with ThreadPoolExecutor(max_workers=MAX_CALL_WORKERS) as pool:
+                for group in pool.map(instances_of, raw):
+                    instances.extend(group)
+        return {"scale_sets": sets, "scale_set_instances": instances}
 
     def list_vms():
         """VMs, with run-time power state merged in from a second pass.
@@ -833,8 +921,8 @@ def scan_subscription(client, sub):
                 with lock:
                     stats["failures"] += 1
                     errors.append(f"{key}: collection failed unexpectedly: {condense(e)}")
-                result = {} if key == "backup" else []
-            if key == "backup":
+                result = {} if key in ("backup", "scale_sets") else []
+            if key in ("backup", "scale_sets"):
                 collected.update(result)
             else:
                 collected[key] = result
@@ -851,7 +939,8 @@ def scan_subscription(client, sub):
     # the file should not mean unioning six arrays by hand.
     locations = {
         item.get("location")
-        for key in ("disks", "virtual_machines", "scale_sets", "snapshots", "images", "backup_vaults")
+        for key in ("disks", "virtual_machines", "scale_sets", "scale_set_instances",
+                    "snapshots", "images", "backup_vaults")
         for item in collected.get(key, [])
         if item.get("location")
     }
@@ -861,7 +950,7 @@ def scan_subscription(client, sub):
         errors=sorted(set(errors)),
         locations=sorted(locations),
         **{k: collected.get(k, []) for k in (
-            "disks", "virtual_machines", "scale_sets", "snapshots",
+            "disks", "virtual_machines", "scale_sets", "scale_set_instances", "snapshots",
             "images", "backup_vaults", "backup_policies")},
     )
 

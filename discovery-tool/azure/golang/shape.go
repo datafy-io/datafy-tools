@@ -171,7 +171,51 @@ func shapeScaleSet(s map[string]any) map[string]any {
 		"os_disk_size_gb":              dig(profile, "osDisk", "diskSizeGB"),
 		"os_disk_storage_account_type": dig(profile, "osDisk", "managedDisk", "storageAccountType"),
 		"data_disks":                   dataDisks,
+		"priority":                     dig(props, "virtualMachineProfile", "priority"),
+		"image_reference":              imageReferenceOf(map[string]any{"storageProfile": profile}),
+		"aks_pool":                     aksPoolOf(s),
 		"tags":                         tagsOf(s),
+	}
+}
+
+// aksPoolOf names the AKS node pool a scale set backs, from the tag AKS puts
+// on every scale set it manages. Nil for a scale set that is not AKS's, which
+// is how a reader tells a Kubernetes node from any other scale-set instance.
+func aksPoolOf(r map[string]any) any {
+	return asObject(r["tags"])["aks-managed-poolName"]
+}
+
+// shapeScaleSetInstance reports one instance of a scale set.
+//
+// A Uniform scale set's instances are not in the subscription's virtualMachines
+// list, so this is the only place they appear — and for AKS, where every node
+// is a Uniform scale-set instance, it is where the nodes are. It carries the
+// same fields as a virtual_machines entry so the two can be read the same way.
+func shapeScaleSetInstance(i, set map[string]any) map[string]any {
+	props := asObject(i["properties"])
+	setProps := asObject(set["properties"])
+	return map[string]any{
+		"id":                   i["id"],
+		"name":                 i["name"],
+		"resource_group":       resourceGroupOf(i["id"]),
+		"location":             i["location"],
+		"zones":                listOf(i, "zones"),
+		"instance_id":          i["instanceId"],
+		"vm_id":                props["vmId"],
+		"computer_name":        dig(props, "osProfile", "computerName"),
+		"vm_size":              dig(i, "sku", "name"),
+		"provisioning_state":   props["provisioningState"],
+		"power_state":          powerState(props),
+		"latest_model_applied": props["latestModelApplied"],
+		"os_type":              dig(props, "storageProfile", "osDisk", "osType"),
+		"priority":             dig(setProps, "virtualMachineProfile", "priority"),
+		"scale_set_id":         set["id"],
+		"scale_set_name":       set["name"],
+		"aks_pool":             aksPoolOf(set),
+		"os_disk":              osDiskOf(props),
+		"data_disks":           dataDisksOf(props),
+		"image_reference":      imageReferenceOf(props),
+		"tags":                 tagsOf(i),
 	}
 }
 
