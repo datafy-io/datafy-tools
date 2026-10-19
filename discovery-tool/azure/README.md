@@ -198,7 +198,7 @@ The tool calls only these, all reads:
 | `Microsoft.Management/managementGroups/descendants/read` | Only with `--management-group` |
 | `Microsoft.Compute/disks/read` | Managed disk inventory |
 | `Microsoft.Compute/virtualMachines/read` | VM inventory and power state |
-| `Microsoft.Compute/virtualMachineScaleSets/read` | Scale set inventory |
+| `Microsoft.Compute/virtualMachineScaleSets/read` and `.../virtualMachines/read` | Scale set inventory, and the instances in each (AKS nodes) |
 | `Microsoft.Compute/snapshots/read` | Snapshot inventory |
 | `Microsoft.Compute/images/read` | Managed image inventory |
 | `Microsoft.RecoveryServices/vaults/read` and `.../backupPolicies/read` | Classic backup policies |
@@ -464,6 +464,7 @@ One per subscription:
   "disks": [...],
   "virtual_machines": [...],
   "scale_sets": [...],
+  "scale_set_instances": [...],
   "snapshots": [...],
   "images": [...],
   "backup_vaults": [...],
@@ -480,6 +481,13 @@ inaccessible one are never indistinguishable:
 | `partial` | Some calls were denied or failed. The data is incomplete; `errors` says which calls and why. |
 | `failed` | The subscription could not be read at all. All arrays are empty and `errors` explains why. |
 | `skipped` | Azure does not report the subscription as `Enabled`, so it was never scanned. `reason` says which state it is in. |
+
+`scale_set_instances` holds the instances of every Uniform scale set, with power
+state, disks and image, in the same shape as `virtual_machines`. Azure does not
+list them in the subscription's VM list, and AKS runs every node as one — an
+instance's `aks_pool` (also on its `scale_sets` entry) is set for those. Flexible
+scale sets are already in `virtual_machines`, and a scale set at zero capacity
+has no instances to list.
 
 `errors` entries name the provider and the reason, e.g.
 `"Microsoft.Compute/disks: AuthorizationFailed: The client does not have authorization to perform action..."`.

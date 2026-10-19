@@ -349,7 +349,8 @@ def make_scale_sets(sub, n):
         "type": "Microsoft.Compute/virtualMachineScaleSets",
         "location": location_for(i),
         "zones": ["1", "2"],
-        "tags": {},
+        # Every other scale set is one AKS manages, as it tags them.
+        "tags": {"aks-managed-poolName": f"pool{i}"} if i % 2 == 0 else {},
         "sku": {"name": "Standard_D2s_v3", "tier": "Standard", "capacity": 3 + i},
         "properties": {
             "orchestrationMode": "Uniform",
@@ -362,6 +363,55 @@ def make_scale_sets(sub, n):
             }},
         },
     } for i in range(n)]
+
+
+def make_scale_set_instances(sub, rg, name, with_instance_view):
+    """Instances of a scale set, as ARM lists them under the scale set.
+
+    These are the nodes AKS runs: a Uniform scale set's instances are not in the
+    subscription's virtualMachines list, only here.
+    """
+    index = int(name.rsplit("-", 1)[-1])
+    out = []
+    for n in range(3 + index):
+        props = {
+            "vmId": f"vmssid-{sub}-{index}-{n}",
+            "provisioningState": "Succeeded",
+            "latestModelApplied": n % 2 == 0,
+            "osProfile": {"computerName": f"{name}{n:06d}"},
+            "storageProfile": {
+                "osDisk": {
+                    "name": f"{name}_{n}_osdisk", "osType": "Linux", "diskSizeGB": 30,
+                    "caching": "ReadOnly", "createOption": "FromImage",
+                    "managedDisk": {
+                        "id": rid(sub, rg, "Microsoft.Compute/disks", f"{name}_{n}_osdisk"),
+                        "storageAccountType": "Premium_LRS",
+                    },
+                },
+                "dataDisks": [],
+                "imageReference": {
+                    "publisher": "microsoft-aks", "offer": "aks", "sku": "aks-ubuntu-2204",
+                    "version": "latest", "exactVersion": "202601.01.0",
+                },
+            },
+        }
+        if with_instance_view:
+            props["instanceView"] = {"statuses": [
+                {"code": "ProvisioningState/succeeded"},
+                {"code": "PowerState/running" if n % 3 else "PowerState/stopped"},
+            ]}
+        out.append({
+            "id": f"{rid(sub, rg, 'Microsoft.Compute/virtualMachineScaleSets', name)}/virtualMachines/{n}",
+            "name": f"{name}_{n}",
+            "instanceId": str(n),
+            "type": "Microsoft.Compute/virtualMachineScaleSets/virtualMachines",
+            "location": location_for(index),
+            "zones": ["1"],
+            "tags": {},
+            "sku": {"name": "Standard_D2s_v3", "tier": "Standard"},
+            "properties": props,
+        })
+    return out
 
 
 def make_vaults(sub, n, provider):
@@ -633,6 +683,22 @@ class Handler(BaseHTTPRequestHandler):
                                        f"action 'read' over scope {'/'.join(parts)}.")
                 n = count_for(sub, "policies", 0)
                 return self._paged(make_policies(sub, parts[3], provider, vault, n))
+            finally:
+                end_call()
+
+        # /subscriptions/<sub>/resourceGroups/<rg>/providers/Microsoft.Compute/virtualMachineScaleSets/<name>/virtualMachines
+        if len(parts) == 9 and parts[2].lower() == "resourcegroups" and parts[-1] == "virtualMachines" \
+                and parts[6] == "virtualMachineScaleSets":
+            resource_type = "Microsoft.Compute/virtualMachineScaleSets/virtualMachines"
+            note_call(resource_type)
+            try:
+                if denied(sub, resource_type):
+                    return self._error(403, "AuthorizationFailed",
+                                       f"The client does not have authorization to perform "
+                                       f"action '{resource_type}/read' over scope {'/'.join(parts)}.")
+                expand = any("instanceView" in v for k, vs in query.items()
+                             if k.startswith("$expand") for v in vs)
+                return self._paged(make_scale_set_instances(sub, parts[3], parts[7], expand))
             finally:
                 end_call()
 

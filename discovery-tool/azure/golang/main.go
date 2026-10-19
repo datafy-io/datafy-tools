@@ -77,6 +77,7 @@ var api = map[string]string{
 	"snapshots":        apiVer("SNAPSHOTS", "2023-04-02"),
 	"virtual_machines": apiVer("VIRTUAL_MACHINES", "2023-09-01"),
 	"scale_sets":       apiVer("SCALE_SETS", "2023-09-01"),
+	"scale_set_vms":    apiVer("SCALE_SET_VMS", "2023-09-01"),
 	"images":           apiVer("IMAGES", "2023-09-01"),
 	"rsv_vaults":       apiVer("RSV_VAULTS", "2023-04-01"),
 	"rsv_policies":     apiVer("RSV_POLICIES", "2023-02-01"),
