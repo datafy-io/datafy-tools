@@ -35,8 +35,9 @@ failed with the AWS error, which you should report grouped by account.
 1. `python3 ${CLAUDE_PLUGIN_ROOT}/scripts/sample_volumes.py` — picks a stratified, reproducible sample (5%, min 10,
    max 500) of volumes on running Linux instances. Tell the customer the population, the target, and how many
    volumes are unmeasurable (unattached, stopped, Windows).
-2. `python3 ${CLAUDE_PLUGIN_ROOT}/scripts/collect_utilization.py plan` — shows the instance list by account/region
-   and the exact command. Present this to the customer verbatim.
+2. `python3 ${CLAUDE_PLUGIN_ROOT}/scripts/collect_utilization.py plan` — gives you the instance list by
+   account/region. You use this to write the approval message (see "Asking for approval"); do not paste the plan
+   JSON at the customer.
 3. `... check ssm` (free) — is `DatafyDiskUsage` deployed in each account/region? If any are `missing`, tell the
    customer plainly and offer, grouped by account:
    - **(a) Deploy it** with `deploy-doc ssm --yes`: creates only that one read-only document, tagged
@@ -45,7 +46,7 @@ failed with the AWS error, which you should report grouped by account.
    - **(b) Deploy it themselves** from `iam/datafy-disk-usage.cfn.yaml` (e.g. a StackSet).
    - **(c) Use the stock `AWS-RunShellScript`** (`--use-aws-runshellscript`): no deployment, but that document
      can run arbitrary commands, so only if they ask for it and understand the difference.
-4. Get an explicit yes for the plan, then `... run ssm --yes`. Never run any command other than the fixed one.
+4. Get an explicit yes using the approval message below, then `... run ssm --yes`. Never run any command other than the fixed one.
    Report results grouped by status and reason: `not_managed` / `ssm_offline` mean no SSM agent or instance
    profile on that instance; explain and do not retry in a loop.
 5. Rebuild: `build_db.py`, then summarize measured volumes against the 5% target, and offer
@@ -55,6 +56,25 @@ CloudWatch (optional): `collect_utilization.py plan cloudwatch`, show the cost, 
 
 If the customer declines, record it so you do not ask again this run:
 `echo '{"ssm": true}' > datafy-explorer/.declined.json` (or `"cloudwatch"`).
+
+## Asking for approval
+
+Write the approval request in plain language. **Never show the customer script names, flags or CLI invocations**
+(no `collect_utilization.py ...`, no `--yes`, no `--profile`). Include, in this order:
+
+1. **What and where:** "I'd like to check disk usage on N instances (a 5% sample of your volumes) across X accounts
+   and Y regions," with the instances listed by account.
+2. **A reassurance that is accurate and complete**, for example:
+   > This only runs `df` (the same report as `df -h`) and `lsblk` (which lists which disk is which). They read
+   > disk sizes and usage and nothing else: nothing is installed, changed or deleted, and nothing is sent to
+   > Datafy. The results come back to this machine only. I can show you the exact command if you'd like.
+   Do not claim it runs "only `df -h`": it is `df` plus `lsblk`, and saying less would be untrue.
+3. **What may not work**, briefly: instances without the SSM agent can't be reached and will be reported, not retried.
+4. A plain yes/no question. On "no", record the decline and do not ask again this run.
+
+Only if the customer asks for the exact command, show `REMOTE_COMMAND` from `scripts/collect_utilization.py`.
+The same rule applies to the missing-document offer: describe it ("create one small read-only SSM document that
+holds that command; I'll offer to delete it afterwards") without printing flags.
 
 ## Hard rules
 

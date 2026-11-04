@@ -28,7 +28,7 @@ Needs Python 3.9+, `boto3` (`pip install boto3`), and AWS credentials for your m
 | Sample | A representative **5%** of volumes is chosen (min 10, max 500) | Shown to you |
 | Document check | Looks for the read-only `DatafyDiskUsage` SSM document in each account/region (free) | Shown to you |
 | Deploy document (only if missing) | Creates that one document, tagged, and offers to delete it afterwards | **Explicit yes**, per run |
-| `df` over SSM (default) | Runs one fixed read-only command on the sampled instances | **Explicit yes**, with the instance list and exact command shown |
+| `df` over SSM (default) | Runs one fixed read-only command on the sampled instances | **Explicit yes**, with the instance list and a plain-language explanation. Only `df` and `lsblk` run, and the exact command is shown on request |
 | CloudWatch (optional) | Reads `disk_used_percent`; touches no instance | Cost shown first; **hard cap $1** |
 | Dashboard | Static HTML file written locally | none |
 
