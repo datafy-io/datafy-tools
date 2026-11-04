@@ -1,0 +1,23 @@
+name: Plugin tests
+
+on:
+  push:
+    branches: [master]
+    paths: ["plugins/**", ".claude-plugin/**", ".github/workflows/plugin-tests.yml"]
+  pull_request:
+    paths: ["plugins/**", ".claude-plugin/**", ".github/workflows/plugin-tests.yml"]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Validate manifests
+        run: |
+          python3 -c "import json; json.load(open('.claude-plugin/marketplace.json')); json.load(open('plugins/datafy-aws-explorer/.claude-plugin/plugin.json')); json.load(open('plugins/datafy-aws-explorer/scanner.lock.json'))"
+      - name: Tests (includes the no-calling-home and cost-budget guards)
+        working-directory: plugins/datafy-aws-explorer/tests
+        run: python3 -m unittest discover -p "test_*.py" -v

@@ -1,0 +1,42 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Datafy AWS Explorer - a least-privilege role the management account assumes in each member
+  account to measure disk utilization (tier 1 CloudWatch, tier 2 SSM). It can read CloudWatch
+  metrics and SSM inventory, and run ONLY the DatafyDiskUsage document. Deploy once per
+  account (IAM is global), as a service-managed StackSet to the whole organization.
+Parameters:
+  ManagementAccountId:
+    Type: String
+    AllowedPattern: "^[0-9]{12}$"
+    Description: The AWS Organizations management account that runs the plugin.
+Resources:
+  DatafyExplorerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: DatafyExplorerRole
+      MaxSessionDuration: 3600
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { AWS: !Sub "arn:aws:iam::${ManagementAccountId}:root" }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: DatafyExplorerMeasure
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: ReadSsmInventory
+                Effect: Allow
+                Action: [ssm:DescribeInstanceInformation, ssm:ListCommandInvocations, ssm:GetCommandInvocation]
+                Resource: "*"
+              - Sid: RunOnlyTheDatafyDiskUsageDocument
+                Effect: Allow
+                Action: ssm:SendCommand
+                Resource:
+                  - "arn:aws:ssm:*:*:document/DatafyDiskUsage"
+                  - "arn:aws:ec2:*:*:instance/*"
+              - Sid: ReadCloudWatchAgentDiskMetrics
+                Effect: Allow
+                Action: [cloudwatch:ListMetrics, cloudwatch:GetMetricData]
+                Resource: "*"

@@ -1,0 +1,12 @@
+{
+  "name": "datafy-tools",
+  "description": "Datafy tools for exploring and sizing cloud storage. Everything runs on your machine; nothing is sent to Datafy.",
+  "owner": { "name": "Datafy", "url": "https://datafy.io" },
+  "plugins": [
+    {
+      "name": "datafy-aws-explorer",
+      "source": "./plugins/datafy-aws-explorer",
+      "description": "Explore your AWS estate: run the read-only Datafy discovery scan, ask questions about the results, sample real disk utilization, and build an offline dashboard. Nothing is sent to Datafy."
+    }
+  ]
+}

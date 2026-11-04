@@ -1,0 +1,20 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "ReadSsmInventory",
+      "Effect": "Allow",
+      "Action": ["ssm:DescribeInstanceInformation", "ssm:ListCommandInvocations", "ssm:GetCommandInvocation"],
+      "Resource": "*"
+    },
+    {
+      "Sid": "RunOnlyTheDatafyDiskUsageDocument",
+      "Effect": "Allow",
+      "Action": "ssm:SendCommand",
+      "Resource": [
+        "arn:aws:ssm:*:*:document/DatafyDiskUsage",
+        "arn:aws:ec2:*:*:instance/*"
+      ]
+    }
+  ]
+}

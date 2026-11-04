@@ -1,0 +1,22 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Datafy AWS Explorer - a fixed, read-only SSM document that prints disk usage.
+  The document contains exactly one command (df + lsblk). Granting ssm:SendCommand on
+  this document only (see ssm-sendcommand-policy.json) means the explorer cannot run
+  anything else on your instances.
+Resources:
+  DatafyDiskUsage:
+    Type: AWS::SSM::Document
+    Properties:
+      Name: DatafyDiskUsage
+      DocumentType: Command
+      DocumentFormat: YAML
+      Content:
+        schemaVersion: "2.2"
+        description: Report filesystem usage (df) and block device serials (lsblk). Read-only.
+        mainSteps:
+          - action: aws:runShellScript
+            name: diskUsage
+            inputs:
+              runCommand:
+                - "echo '---DF---'; df -PT -B1 2>/dev/null; echo '---LSBLK---'; lsblk -J -o NAME,SERIAL,SIZE,TYPE,MOUNTPOINT 2>/dev/null || true"
