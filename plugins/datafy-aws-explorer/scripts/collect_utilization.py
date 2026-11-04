@@ -1,0 +1,588 @@
+#!/usr/bin/env python3
+"""Collect real disk utilization for the sampled instances.
+
+Two tiers, both writing utilization.jsonl (one `instance` record per instance):
+
+  cloudwatch  Reads disk_used_percent from the CWAgent namespace. Touches no instance.
+              Billed (a few cents at most) and bounded by a hard $1 cap.
+  ssm         Runs one fixed read-only command (df + lsblk) on the instances through SSM Run Command, using
+              the stock AWS-RunShellScript document: nothing is created in your account. Requires explicit
+              approval (--yes). Free of AWS charges. (--use-document: use a dedicated DatafyDiskUsage document
+              instead, for customers who want IAM to enforce "this command only".)
+
+Both default to a PLAN: they print what would happen (targets, cost, exact command) and
+change nothing. Add --yes to execute. Nothing is ever sent anywhere but your own AWS.
+
+  collect_utilization.py inventory                     which instances can SSM reach? (free, read-only; run before sampling)
+  collect_utilization.py plan       [ssm|cloudwatch]   show the plan (no AWS calls). ssm is the default.
+  collect_utilization.py run        [ssm|cloudwatch] --yes
+  Opt-in document mode (--use-document), only if you want IAM-enforced restriction:
+  collect_utilization.py check      ssm                is DatafyDiskUsage deployed where we need it? (free)
+  collect_utilization.py deploy-doc ssm --yes          create DatafyDiskUsage where missing (approval required)
+  collect_utilization.py remove-doc ssm --yes          delete the documents this tool created
+"""
+import argparse
+import json
+import os
+import re
+import time
+from datetime import datetime, timedelta, timezone
+
+from common import (BudgetExceeded, CostBudget, INVENTORY_FILE, UTILIZATION_FILE, append_jsonl, log, now_iso, read_discovery,
+                    read_jsonl, volume_index, workspace)
+
+DOC_NAME = "DatafyDiskUsage"
+STOCK_DOC = "AWS-RunShellScript"   # default: exists everywhere, so nothing is created in the customer account
+# The ONLY command this tool ever runs on an instance, whichever document carries it. It is also the content of the
+# optional DatafyDiskUsage document (iam/datafy-disk-usage.cfn.yaml); the test suite asserts they match.
+REMOTE_COMMAND = ("echo '---DF---'; df -PT -B1 2>/dev/null; "
+                  "echo '---LSBLK---'; lsblk -J -o NAME,SERIAL,SIZE,TYPE,MOUNTPOINT 2>/dev/null || true")
+DOC_TAG = {"Key": "created-by", "Value": "datafy-aws-explorer"}
+DOC_CONTENT = {
+    "schemaVersion": "2.2",
+    "description": "Report filesystem usage (df) and block device serials (lsblk). Read-only.",
+    "mainSteps": [{"action": "aws:runShellScript", "name": "diskUsage", "inputs": {"runCommand": [REMOTE_COMMAND]}}],
+}
+SSM_BATCH = 50          # SendCommand target limit
+CW_QUERY_BATCH = 500    # GetMetricData query limit
+PSEUDO_FS = {"tmpfs", "devtmpfs", "overlay", "squashfs", "proc", "sysfs", "cgroup", "cgroup2", "efivarfs",
+             "iso9660", "ramfs", "nfs", "nfs4", "efs", "fuse", "fuse.sshfs", "autofs"}
+
+
+# ── parsing ────────────────────────────────────────────────────────────────
+
+def vol_from_serial(serial):
+    """EBS exposes its volume id as the NVMe serial, with the dash removed."""
+    s = (serial or "").strip()
+    return "vol-" + s[3:] if re.fullmatch(r"vol[0-9a-f]{8,17}", s) else None
+
+
+def parse_df(text):
+    rows = []
+    for line in text.strip().splitlines()[1:]:
+        p = line.split(None, 6)
+        if len(p) < 7 or not p[0].startswith("/dev/") or p[1] in PSEUDO_FS:
+            continue
+        try:
+            size, used, avail = int(p[2]), int(p[3]), int(p[4])
+        except ValueError:
+            continue
+        rows.append({"device": p[0], "fstype": p[1], "size_bytes": size, "used_bytes": used,
+                     "avail_bytes": avail, "used_pct": round(100.0 * used / (used + avail), 1) if used + avail else 0.0,
+                     "mountpoint": p[6]})
+    return rows
+
+
+def _walk(node, chain, found):
+    chain = chain + [node]
+    for c in node.get("children") or []:
+        _walk(c, chain, found)
+    found.setdefault(node["name"], []).append(chain)
+
+
+def device_volumes(lsblk_json):
+    """{device basename: sorted set of volume ids reachable up the device tree}."""
+    try:
+        tree = json.loads(lsblk_json)
+    except ValueError:
+        return {}
+    found = {}
+    for top in tree.get("blockdevices", []):
+        _walk(top, [], found)
+    out = {}
+    for name, chains in found.items():
+        vols = set()
+        for chain in chains:
+            for n in chain:
+                v = vol_from_serial(n.get("serial"))
+                if v:
+                    vols.add(v)
+        out[name] = sorted(vols)
+    return out
+
+
+def parse_ssm_output(text):
+    """-> (mounts, note). Each mount carries volume_id (or None) and volume_ids (>1 for LVM/RAID)."""
+    df_part, _, lsblk_part = text.partition("---LSBLK---")
+    df_part = df_part.replace("---DF---", "")
+    mounts = parse_df(df_part)
+    dev_vols = device_volumes(lsblk_part) if lsblk_part.strip() else {}
+    for m in mounts:
+        vols = dev_vols.get(os.path.basename(m["device"]), [])
+        m["volume_ids"] = vols
+        m["volume_id"] = vols[0] if len(vols) == 1 else None
+    note = None if dev_vols else "lsblk unavailable: mounts could not be tied to volumes by serial"
+    return mounts, note
+
+
+def norm_device(dev):
+    """/dev/sdf1, /dev/xvdf, xvdf1 -> 'xvdf' (Xen-style names; NVMe names cannot be mapped this way)."""
+    d = os.path.basename(dev or "")
+    d = re.sub(r"^sd", "xvd", d)
+    return re.sub(r"p?\d+$", "", d) if d.startswith("xvd") else d
+
+
+def map_by_name(mounts, attached):
+    """Fallback when serials are missing. attached: [{'VolumeId','Device'}]. Only certain matches are made."""
+    by_dev = {}
+    for a in attached:
+        by_dev.setdefault(norm_device(a.get("Device")), []).append(a["VolumeId"])
+    for m in mounts:
+        if m.get("volume_id"):
+            continue
+        v = by_dev.get(norm_device(m["device"]), [])
+        if len(v) == 1:
+            m["volume_id"] = v[0]
+    return mounts
+
+
+# ── clients ────────────────────────────────────────────────────────────────
+
+class Sessions:
+    """One boto3 session per (account, region), assuming a role into other accounts."""
+
+    def __init__(self, profile=None, role="OrganizationAccountAccessRole"):
+        import boto3
+        self._boto3, self.role = boto3, role
+        self.base = boto3.Session(profile_name=profile) if profile else boto3.Session()
+        self.caller = self.base.client("sts").get_caller_identity()["Account"]
+        self._cache = {}
+
+    def client(self, service, account, region):
+        k = (account, region)
+        if k not in self._cache:
+            if account == self.caller:
+                self._cache[k] = self.base
+            else:
+                c = self.base.client("sts").assume_role(
+                    RoleArn="arn:aws:iam::%s:role/%s" % (account, self.role),
+                    RoleSessionName="datafy-explorer")["Credentials"]
+                self._cache[k] = self._boto3.Session(
+                    aws_access_key_id=c["AccessKeyId"], aws_secret_access_key=c["SecretAccessKey"],
+                    aws_session_token=c["SessionToken"])
+        return self._cache[k].client(service, region_name=region)
+
+
+def targets_by_scope(ws, instance_ids):
+    """Group instance ids by (account, region) using discovery data."""
+    inst = {}
+    for r in read_discovery(ws):
+        if r.get("record_type") == "region":
+            for i in r.get("instances", []):
+                inst[i["InstanceId"]] = (r["account_id"], r["region"], i)
+    scopes, unknown = {}, []
+    for iid in instance_ids:
+        if iid in inst:
+            a, g, i = inst[iid]
+            scopes.setdefault((a, g), []).append(iid)
+        else:
+            unknown.append(iid)
+    return scopes, unknown
+
+
+def already_done(ws, source):
+    return {r["instance_id"] for r in read_jsonl(os.path.join(ws, UTILIZATION_FILE))
+            if r.get("record_type") == "instance" and r.get("source") == source and r.get("status") == "ok"}
+
+
+def record(ws, iid, account, region, source, status, reason=None, mounts=None):
+    append_jsonl(os.path.join(ws, UTILIZATION_FILE), {
+        "record_type": "instance", "instance_id": iid, "account_id": account, "region": region,
+        "source": source, "status": status, "reason": reason, "mounts": mounts or [], "collected_at": now_iso()})
+
+
+# ── SSM tier ───────────────────────────────────────────────────────────────
+
+def ssm_inventory(ws, sessions):
+    """Record, for every running Linux instance, whether SSM can reach it. Uses only
+    ssm:DescribeInstanceInformation (free, read-only). Overwrites ssm_inventory.jsonl: it is a fresh snapshot."""
+    running = {}
+    for r in read_discovery(ws):
+        if r.get("record_type") != "region":
+            continue
+        for i in r.get("instances", []):
+            if i.get("State") == "running" and "windows" not in (i.get("PlatformDetails") or "").lower():
+                running.setdefault((r["account_id"], r["region"]), []).append(i["InstanceId"])
+    path = os.path.join(ws, INVENTORY_FILE)
+    open(path, "w").close()
+    stats = {"scopes": len(running), "instances": sum(len(v) for v in running.values()), "reachable": 0,
+             "not_managed": 0, "offline": 0, "errors": 0}
+    for (account, region), ids in sorted(running.items()):
+        try:
+            ssm = sessions.client("ssm", account, region)
+            info = {}
+            for i in range(0, len(ids), SSM_BATCH):
+                resp = ssm.describe_instance_information(Filters=[{"Key": "InstanceIds", "Values": ids[i:i + SSM_BATCH]}])
+                for x in resp.get("InstanceInformationList", []):
+                    info[x["InstanceId"]] = x
+        except Exception as e:  # noqa: BLE001 - recorded, so an unreadable scope is not mistaken for "unreachable"
+            for iid in ids:
+                append_jsonl(path, {"record_type": "ssm", "instance_id": iid, "account_id": account, "region": region,
+                                    "managed": False, "error": _err(e), "checked_at": now_iso()})
+            stats["errors"] += len(ids)
+            continue
+        for iid in ids:
+            x = info.get(iid)
+            append_jsonl(path, {"record_type": "ssm", "instance_id": iid, "account_id": account, "region": region,
+                                "managed": bool(x), "ping_status": x.get("PingStatus") if x else None,
+                                "platform_type": x.get("PlatformType") if x else None,
+                                "agent_version": x.get("AgentVersion") if x else None, "checked_at": now_iso()})
+            if not x:
+                stats["not_managed"] += 1
+            elif x.get("PingStatus") != "Online":
+                stats["offline"] += 1
+            else:
+                stats["reachable"] += 1
+    return stats
+
+
+def _code(e):
+    return getattr(e, "response", {}).get("Error", {}).get("Code")
+
+
+def doc_state(ssm):
+    """'present' | 'missing' | 'error: ...' for DatafyDiskUsage in this account/region (describe is free)."""
+    try:
+        ssm.describe_document(Name=DOC_NAME)
+        return "present"
+    except Exception as e:  # noqa: BLE001
+        return "missing" if _code(e) == "InvalidDocument" else "error: %s" % _err(e)
+
+
+def scopes_for(ws, instance_ids):
+    return targets_by_scope(ws, [i for i in instance_ids if i not in already_done(ws, "ssm_df")])[0]
+
+
+def check_docs(ws, instance_ids, sessions):
+    """{'acct/region': state} for every scope the sample touches."""
+    out = {}
+    for (account, region) in scopes_for(ws, instance_ids):
+        try:
+            out["%s/%s" % (account, region)] = doc_state(sessions.client("ssm", account, region))
+        except Exception as e:  # noqa: BLE001
+            out["%s/%s" % (account, region)] = "error: %s" % _err(e)
+    return out
+
+
+def deploy_docs(ws, instance_ids, sessions):
+    """Create DatafyDiskUsage where it is missing. Tagged so remove_docs only deletes what we made."""
+    res = {}
+    for key, st in check_docs(ws, instance_ids, sessions).items():
+        account, region = key.split("/")
+        if st != "missing":
+            res[key] = "already present" if st == "present" else st
+            continue
+        try:
+            sessions.client("ssm", account, region).create_document(
+                Content=json.dumps(DOC_CONTENT), Name=DOC_NAME, DocumentType="Command",
+                DocumentFormat="JSON", Tags=[DOC_TAG])
+            res[key] = "created"
+        except Exception as e:  # noqa: BLE001
+            res[key] = "failed: %s" % _err(e)
+    return res
+
+
+def remove_docs(ws, sessions):
+    """Delete DatafyDiskUsage only where this tool created it (tag check), across scopes seen in utilization.jsonl."""
+    res = {}
+    seen = {(r["account_id"], r["region"]) for r in read_jsonl(os.path.join(ws, UTILIZATION_FILE))
+            if r.get("record_type") == "instance" and r.get("source") == "ssm_df"}
+    for account, region in sorted(seen):
+        key = "%s/%s" % (account, region)
+        try:
+            ssm = sessions.client("ssm", account, region)
+            tags = ssm.list_tags_for_resource(ResourceType="Document", ResourceId=DOC_NAME).get("TagList", [])
+            if DOC_TAG not in tags:
+                res[key] = "left alone (not created by this tool)"
+                continue
+            ssm.delete_document(Name=DOC_NAME, Force=True)
+            res[key] = "deleted"
+        except Exception as e:  # noqa: BLE001
+            res[key] = "skipped: %s" % _err(e)
+    return res
+
+def ssm_plan(ws, instance_ids, use_document=False):
+    todo = [i for i in instance_ids if i not in already_done(ws, "ssm_df")]
+    scopes, unknown = targets_by_scope(ws, todo)
+    return {
+        "tier": "ssm", "document": DOC_NAME if use_document else STOCK_DOC,
+        "command": REMOTE_COMMAND, "instances": todo, "skipped_already_done": len(instance_ids) - len(todo),
+        "unknown_instances": unknown, "scopes": {"%s/%s" % k: v for k, v in scopes.items()},
+        "estimated_aws_cost_usd": 0.0,
+        "note": ("SSM Run Command is free. Output is returned inline, never written to S3. Nothing is created in the account."
+                 if not use_document else
+                 "Document mode: DatafyDiskUsage must exist in each account/region in 'scopes': run `check ssm`, "
+                 "then `deploy-doc ssm --yes` if missing."),
+    }
+
+
+def run_ssm(ws, instance_ids, sessions, use_document=False, poll=2.0, timeout=120, sleep=time.sleep):
+    plan = ssm_plan(ws, instance_ids, use_document)
+    idx = volume_index(read_discovery(ws))
+    attached = {}
+    for e in idx.values():
+        if e["instance"]:
+            attached.setdefault(e["instance"]["InstanceId"], []).append(e["volume"])
+    scopes, _ = targets_by_scope(ws, plan["instances"])
+    stats = {"ok": 0, "failed": 0, "skipped": 0}
+    for (account, region), ids in scopes.items():
+        try:
+            ssm = sessions.client("ssm", account, region)
+            info = {}
+            for i in range(0, len(ids), SSM_BATCH):
+                resp = ssm.describe_instance_information(
+                    Filters=[{"Key": "InstanceIds", "Values": ids[i:i + SSM_BATCH]}])
+                for x in resp.get("InstanceInformationList", []):
+                    info[x["InstanceId"]] = x
+        except Exception as e:  # noqa: BLE001 - recorded, not hidden
+            for iid in ids:
+                record(ws, iid, account, region, "ssm_df", "failed", "ssm:DescribeInstanceInformation: %s" % _err(e))
+                stats["failed"] += 1
+            continue
+        ready = []
+        for iid in ids:
+            x = info.get(iid)
+            if not x:
+                record(ws, iid, account, region, "ssm_df", "skipped", "not_managed: no SSM agent or instance profile")
+                stats["skipped"] += 1
+            elif x.get("PingStatus") != "Online":
+                record(ws, iid, account, region, "ssm_df", "skipped", "ssm_offline: ping status %s" % x.get("PingStatus"))
+                stats["skipped"] += 1
+            elif x.get("PlatformType") != "Linux":
+                record(ws, iid, account, region, "ssm_df", "skipped", "windows_unsupported")
+                stats["skipped"] += 1
+            else:
+                ready.append(iid)
+        if ready and use_document:
+            st = doc_state(ssm)
+            if st != "present":
+                for iid in ready:
+                    record(ws, iid, account, region, "ssm_df", "skipped",
+                           "document_missing: %s is not deployed in %s/%s (%s)" % (DOC_NAME, account, region, st))
+                    stats["skipped"] += 1
+                continue
+        for i in range(0, len(ready), SSM_BATCH):
+            batch = ready[i:i + SSM_BATCH]
+            try:
+                params = {} if use_document else {"commands": [REMOTE_COMMAND]}
+                cmd = ssm.send_command(InstanceIds=batch, DocumentName=plan["document"], Parameters=params,
+                                       Comment="Datafy disk utilization (read-only)", TimeoutSeconds=60)
+                cid = cmd["Command"]["CommandId"]
+            except Exception as e:  # noqa: BLE001
+                for iid in batch:
+                    record(ws, iid, account, region, "ssm_df", "failed", "ssm:SendCommand: %s" % _err(e))
+                    stats["failed"] += 1
+                continue
+            for iid in batch:
+                st, out, why = _wait_invocation(ssm, cid, iid, poll, timeout, sleep)
+                if st != "Success":
+                    record(ws, iid, account, region, "ssm_df", "failed", why or "command %s" % st)
+                    stats["failed"] += 1
+                    continue
+                mounts, note = parse_ssm_output(out)
+                map_by_name(mounts, attached.get(iid, []))
+                record(ws, iid, account, region, "ssm_df", "partial" if note else "ok", note, mounts)
+                stats["ok"] += 1
+    return stats
+
+
+def _wait_invocation(ssm, cid, iid, poll, timeout, sleep):
+    deadline = time.time() + timeout
+    while True:
+        try:
+            r = ssm.get_command_invocation(CommandId=cid, InstanceId=iid)
+        except Exception as e:  # noqa: BLE001
+            code = getattr(e, "response", {}).get("Error", {}).get("Code")
+            if code == "InvocationDoesNotExist" and time.time() < deadline:
+                sleep(poll)
+                continue
+            return "Failed", "", "ssm:GetCommandInvocation: %s" % _err(e)
+        st = r.get("Status")
+        if st in ("Success", "Failed", "TimedOut", "Cancelled", "Undeliverable", "Terminated", "DeliveryTimedOut",
+                  "ExecutionTimedOut", "AccessDenied", "NoInstancesInTag", "LimitExceeded"):
+            return st, r.get("StandardOutputContent", ""), (r.get("StandardErrorContent") or "")[:200] or None
+        if time.time() >= deadline:
+            return "TimedOut", "", "timed out waiting for the command"
+        sleep(poll)
+
+
+def _err(e):
+    code = getattr(e, "response", {}).get("Error", {}).get("Code")
+    return "%s: %s" % (code, str(e)[:160]) if code else str(e)[:200]
+
+
+# ── CloudWatch tier ────────────────────────────────────────────────────────
+
+def cw_plan(ws, instance_ids, budget):
+    todo = [i for i in instance_ids if i not in already_done(ws, "cloudwatch")]
+    # one ListMetrics per instance, then ~2 mounts per instance as a planning assumption
+    units = {"ListMetrics": len(todo), "GetMetricData": len(todo) * 2}
+    est = budget.estimate(units)
+    keep = todo
+    if est > budget.cap:
+        per = budget.estimate({"ListMetrics": 1, "GetMetricData": 2})
+        keep = todo[:int((budget.cap + 1e-12) // per)]
+        units = {"ListMetrics": len(keep), "GetMetricData": len(keep) * 2}
+        est = budget.estimate(units)
+    return {"tier": "cloudwatch", "instances": keep, "dropped_to_fit_budget": len(todo) - len(keep),
+            "billed_units": units, "estimated_aws_cost_usd": round(est, 5), "cap_usd": budget.cap,
+            "note": "Needs the CloudWatch Agent publishing disk_used_percent. Instances without it are recorded as "
+                    "'no_agent_metrics' and are candidates for the ssm tier."}
+
+
+def run_cloudwatch(ws, instance_ids, sessions, budget, now=None):
+    plan = cw_plan(ws, instance_ids, budget)
+    idx = volume_index(read_discovery(ws))
+    attached = {}
+    for e in idx.values():
+        if e["instance"]:
+            attached.setdefault(e["instance"]["InstanceId"], []).append(e["volume"])
+    scopes, _ = targets_by_scope(ws, plan["instances"])
+    now = now or datetime.now(timezone.utc)
+    stats = {"ok": 0, "failed": 0, "skipped": 0, "stopped_for_budget": False}
+    for (account, region), ids in scopes.items():
+        try:
+            cw = sessions.client("cloudwatch", account, region)
+        except Exception as e:  # noqa: BLE001
+            for iid in ids:
+                record(ws, iid, account, region, "cloudwatch", "failed", "sts:AssumeRole: %s" % _err(e))
+                stats["failed"] += 1
+            continue
+        for iid in ids:
+            try:
+                budget.charge("ListMetrics", 1)
+                metrics = _list_disk_metrics(cw, iid)
+                if not metrics:
+                    record(ws, iid, account, region, "cloudwatch", "skipped", "no_agent_metrics")
+                    stats["skipped"] += 1
+                    continue
+                budget.charge("GetMetricData", len(metrics))
+                pct = _latest(cw, metrics, now)
+            except BudgetExceeded as e:
+                log("stopping: %s" % e)
+                stats["stopped_for_budget"] = True
+                return stats | {"budget": budget.summary()}
+            except Exception as e:  # noqa: BLE001
+                record(ws, iid, account, region, "cloudwatch", "failed", _err(e))
+                stats["failed"] += 1
+                continue
+            mounts = _cw_mounts(metrics, pct, attached.get(iid, []))
+            record(ws, iid, account, region, "cloudwatch", "ok" if mounts else "skipped",
+                   None if mounts else "no_recent_datapoints", mounts)
+            stats["ok" if mounts else "skipped"] += 1
+    return stats | {"budget": budget.summary()}
+
+
+def _list_disk_metrics(cw, iid):
+    out, token = [], None
+    while True:
+        kw = {"Namespace": "CWAgent", "MetricName": "disk_used_percent",
+              "Dimensions": [{"Name": "InstanceId", "Value": iid}]}
+        if token:
+            kw["NextToken"] = token
+        r = cw.list_metrics(**kw)
+        out += r.get("Metrics", [])
+        token = r.get("NextToken")
+        if not token:
+            return out
+
+
+def _latest(cw, metrics, now):
+    res = {}
+    for i in range(0, len(metrics), CW_QUERY_BATCH):
+        chunk = metrics[i:i + CW_QUERY_BATCH]
+        q = [{"Id": "m%d" % (i + j), "MetricStat": {"Metric": m, "Period": 300, "Stat": "Maximum"},
+              "ReturnData": True} for j, m in enumerate(chunk)]
+        r = cw.get_metric_data(MetricDataQueries=q, StartTime=now - timedelta(hours=3), EndTime=now,
+                               ScanBy="TimestampDescending")
+        for x in r.get("MetricDataResults", []):
+            if x.get("Values"):
+                res[x["Id"]] = x["Values"][0]
+    return {int(k[1:]): v for k, v in res.items()}
+
+
+def _cw_mounts(metrics, pct_by_i, attached):
+    mounts = []
+    for i, m in enumerate(metrics):
+        if i not in pct_by_i:
+            continue
+        d = {x["Name"]: x["Value"] for x in m["Dimensions"]}
+        mounts.append({"mountpoint": d.get("path"), "device": d.get("device"), "fstype": d.get("fstype"),
+                       "used_pct": round(pct_by_i[i], 1), "volume_id": None, "volume_ids": []})
+    map_by_name(mounts, attached)
+    # certain case: "/" with a single attached volume on a root device
+    roots = [m for m in mounts if m["mountpoint"] == "/" and not m["volume_id"]]
+    if roots and attached:
+        names = {a["VolumeId"] for a in attached if (a.get("Device") or "") in ("/dev/xvda", "/dev/sda1")}
+        if len(names) == 1:
+            roots[0]["volume_id"] = next(iter(names))
+    by_vol = {a["VolumeId"]: a for a in attached}
+    for m in mounts:  # CloudWatch gives a percentage only: derive bytes from the provisioned size (approximate)
+        v = by_vol.get(m["volume_id"])
+        if v and v.get("Size"):
+            m["size_bytes"] = int(v["Size"]) * 2 ** 30
+            m["used_bytes"] = int(m["size_bytes"] * m["used_pct"] / 100)
+            m["avail_bytes"] = m["size_bytes"] - m["used_bytes"]
+            m["derived"] = True
+    return mounts
+
+
+# ── CLI ────────────────────────────────────────────────────────────────────
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    ap.add_argument("action", choices=["inventory", "plan", "check", "deploy-doc", "run", "remove-doc"])
+    ap.add_argument("tier", nargs="?", choices=["cloudwatch", "ssm"], default="ssm")
+    ap.add_argument("--workspace")
+    ap.add_argument("--profile")
+    ap.add_argument("--role", default="OrganizationAccountAccessRole")
+    ap.add_argument("--instances", help="comma-separated instance ids (default: sample.json)")
+    ap.add_argument("--yes", action="store_true", help="approve and execute")
+    ap.add_argument("--use-document", action="store_true",
+                    help="run through the dedicated DatafyDiskUsage document (must be deployed) instead of the "
+                         "stock AWS-RunShellScript; lets IAM enforce that only this command can run")
+    a = ap.parse_args(argv)
+    ws = workspace(a.workspace)
+    if a.action == "inventory":
+        ids = []
+    elif a.instances:
+        ids = [x for x in a.instances.split(",") if x]
+    else:
+        if not os.path.exists(os.path.join(ws, "sample.json")):
+            raise SystemExit("no sample yet: run sample_volumes.py first")
+        with open(os.path.join(ws, "sample.json")) as f:
+            ids = json.load(f)["instances"]
+    budget = CostBudget()
+    if a.action == "inventory":
+        print(json.dumps(ssm_inventory(ws, Sessions(a.profile, a.role))))
+        return
+    if a.action in ("check", "deploy-doc", "remove-doc"):
+        if a.tier != "ssm":
+            raise SystemExit("%s applies to the ssm tier only" % a.action)
+        if a.action == "check":
+            print(json.dumps(check_docs(ws, ids, Sessions(a.profile, a.role)), indent=1))
+        elif not a.yes:
+            print(json.dumps({"would": a.action, "document": DOC_NAME, "content": DOC_CONTENT,
+                              "scopes": sorted("%s/%s" % k for k in scopes_for(ws, ids))}, indent=1))
+            raise SystemExit("not approved: re-run with --yes after the customer confirms")
+        elif a.action == "deploy-doc":
+            print(json.dumps(deploy_docs(ws, ids, Sessions(a.profile, a.role)), indent=1))
+        else:
+            print(json.dumps(remove_docs(ws, Sessions(a.profile, a.role)), indent=1))
+        return
+    plan = cw_plan(ws, ids, budget) if a.tier == "cloudwatch" else ssm_plan(ws, ids, a.use_document)
+    if a.action == "plan" or not a.yes:
+        print(json.dumps(plan, indent=1))
+        if a.action == "run":
+            raise SystemExit("not approved: re-run with --yes after the customer confirms the plan above")
+        return
+    sessions = Sessions(a.profile, a.role)
+    if a.tier == "cloudwatch":
+        stats = run_cloudwatch(ws, ids, sessions, budget)
+    else:
+        stats = run_ssm(ws, ids, sessions, a.use_document)
+    print(json.dumps(stats))
+
+
+if __name__ == "__main__":
+    main()

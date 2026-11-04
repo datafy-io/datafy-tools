@@ -1,0 +1,648 @@
+import hashlib
+import io
+import json
+import os
+import re
+import sqlite3
+import tempfile
+import unittest
+
+from helpers import ROOT, make_estate, write_ws
+
+import build_db
+import collect_utilization as cu
+import common
+import extrapolate
+import query
+import fetch_scanner
+import sample_volumes as sv
+
+
+class Sampling(unittest.TestCase):
+    def setUp(self):
+        self.idx = common.volume_index(make_estate(400))
+
+    def test_excludes_unmeasurable(self):
+        pop = sv.measurable(self.idx)
+        for e in pop.values():
+            self.assertEqual(e["instance"]["State"], "running")
+        self.assertLess(len(pop), len(self.idx))
+
+    def test_five_percent_with_floor_and_ceiling(self):
+        self.assertEqual(sv.target_size(1000), 50)
+        self.assertEqual(sv.target_size(100), 10)      # floor
+        self.assertEqual(sv.target_size(6), 6)         # never more than exists
+        self.assertEqual(sv.target_size(100000), 500)  # ceiling
+        self.assertEqual(sv.target_size(0), 0)
+
+    def test_deterministic_and_stratified(self):
+        a = sv.draw(self.idx, set())
+        b = sv.draw(self.idx, set())
+        self.assertEqual(a["volumes"], b["volumes"])
+        types = {self.idx[v]["volume"]["VolumeType"] for v in a["volumes"]}
+        self.assertEqual(types, {"gp2", "gp3", "io1"})
+        self.assertEqual(len(a["volumes"]), a["target"])
+        self.assertNotEqual(a["volumes"], sv.draw(self.idx, set(), seed="other")["volumes"])
+
+    def test_cumulative_skips_measured(self):
+        first = sv.draw(self.idx, set())
+        second = sv.draw(self.idx, set(first["volumes"]))
+        self.assertFalse(set(first["volumes"]) & set(second["volumes"]))
+        self.assertEqual(second["volumes"], [])  # target already met
+
+    def test_allocate_more_strata_than_slots(self):
+        alloc = sv.allocate({("a",): 50, ("b",): 5, ("c",): 3}, 2)
+        self.assertEqual(sum(alloc.values()), 2)
+        self.assertEqual(alloc[("a",)], 1)
+
+
+def disks_estate(spec, account="111111111111"):
+    """spec: {instance_id: [data disk sizes]}; every instance also has an 8 GiB root disk. All running Linux."""
+    vols, insts = [], []
+    for iid, data in spec.items():
+        insts.append({"InstanceId": iid, "State": "running", "PlatformDetails": "Linux/UNIX",
+                      "RootDeviceName": "/dev/xvda", "InstanceType": "m5.large", "Tags": []})
+        vols.append({"VolumeId": "vol-%s-root" % iid, "Size": 8, "VolumeType": "gp3", "State": "in-use",
+                     "InstanceId": iid, "Device": "/dev/xvda", "Tags": []})
+        for k, g in enumerate(data):
+            vols.append({"VolumeId": "vol-%s-d%d" % (iid, k), "Size": g, "VolumeType": "gp3", "State": "in-use",
+                         "InstanceId": iid, "Device": "/dev/sd%s" % "fgh"[k], "Tags": []})
+    return [{"record_type": "region", "account_id": account, "region": "us-east-1", "status": "ok", "errors": [],
+             "volumes": vols, "instances": insts, "amis": [], "snapshots": [], "dlm_policies": [], "backup_plans": []}]
+
+
+class LargestSampling(unittest.TestCase):
+    SPEC = {"i-a": [100], "i-b": [2000], "i-c": [500, 40], "i-d": [], "i-e": [4000], "i-f": [1000]}
+
+    def idx(self):
+        return common.volume_index(disks_estate(self.SPEC))
+
+    def test_picks_biggest_data_disks_first_among_reachable_only(self):
+        reach = {"i-a", "i-b", "i-c", "i-d", "i-f"}          # i-e has the biggest disk but is NOT reachable
+        plan = sv.draw_largest(self.idx(), set(), reach, count=4)
+        order = [x["instance_id"] for x in plan["selection"]]
+        self.assertNotIn("i-e", order)
+        self.assertEqual(order[:2], ["i-b", "i-f"])           # 2000 then 1000, then 500 (i-c) ...
+        self.assertEqual(plan["unreachable_by_ssm"], 2)       # i-e's two volumes
+        self.assertEqual(plan["ssm_inventory"], "applied")
+
+    def test_root_only_instances_rank_last(self):
+        plan = sv.draw_largest(self.idx(), set(), None, count=12)   # all 12 volumes: no inventory, everything eligible
+        self.assertEqual(plan["selection"][-1]["instance_id"], "i-d")
+        self.assertEqual(plan["selection"][0]["instance_id"], "i-e")
+
+    def test_target_counts_volumes_and_stops(self):
+        plan = sv.draw_largest(self.idx(), set(), None, count=4)
+        self.assertGreaterEqual(len(plan["volumes"]), 4)
+        self.assertLessEqual(len(plan["instances"]), 3)            # 2 volumes each, so 2 instances suffice
+
+    def test_cumulative_skips_measured_instances(self):
+        first = sv.draw_largest(self.idx(), set(), None, count=2)
+        measured = set(first["volumes"])
+        second = sv.draw_largest(self.idx(), measured, None, count=4)
+        self.assertFalse(set(first["instances"]) & set(second["instances"]))
+
+    def test_missing_inventory_is_said_out_loud(self):
+        self.assertIn("absent", sv.draw_largest(self.idx(), set(), None, count=2)["ssm_inventory"])
+
+    def test_ssm_reachable_reads_inventory(self):
+        ws = write_ws(disks_estate(self.SPEC))
+        self.assertIsNone(common.ssm_reachable(ws))
+        for iid, managed, ping, plat in (("i-a", True, "Online", "Linux"), ("i-b", True, "ConnectionLost", "Linux"),
+                                         ("i-c", False, None, None), ("i-d", True, "Online", "Windows")):
+            common.append_jsonl(os.path.join(ws, "ssm_inventory.jsonl"), {
+                "record_type": "ssm", "instance_id": iid, "managed": managed, "ping_status": ping, "platform_type": plat})
+        self.assertEqual(common.ssm_reachable(ws), {"i-a"})
+
+
+class Inventory(unittest.TestCase):
+    def test_records_reachability_and_unreadable_scopes(self):
+        ws = write_ws(disks_estate({"i-a": [100], "i-b": [100], "i-c": [100]}))
+        ssm = FakeSSM({"i-a": ("Online", "Linux"), "i-b": ("ConnectionLost", "Linux")}, {})
+        stats = cu.ssm_inventory(ws, FakeSessions(ssm=ssm))
+        self.assertEqual((stats["reachable"], stats["offline"], stats["not_managed"]), (1, 1, 1))
+        self.assertEqual(common.ssm_reachable(ws), {"i-a"})
+
+        class Denied:
+            def describe_instance_information(self, Filters):
+                raise _ClientError("AccessDeniedException")
+        stats = cu.ssm_inventory(ws, FakeSessions(ssm=Denied()))
+        self.assertEqual(stats["errors"], 3)
+        recs = common.read_jsonl(os.path.join(ws, "ssm_inventory.jsonl"))
+        self.assertTrue(all("error" in r and not r["managed"] for r in recs))
+
+    def test_inventory_never_sends_a_command(self):
+        ws = write_ws(disks_estate({"i-a": [100]}))
+        ssm = FakeSSM({"i-a": ("Online", "Linux")}, {})
+        cu.ssm_inventory(ws, FakeSessions(ssm=ssm))
+        self.assertEqual(ssm.sent, [])
+
+
+class Extrapolation(unittest.TestCase):
+    def test_no_range_when_sample_tiny(self):
+        idx = common.volume_index(make_estate(200))
+        vols = list(sv.measurable(idx))[:4]
+        out = extrapolate.estimate(idx, {v: 50.0 for v in vols})
+        self.assertIsNone(out["range"])
+
+    def test_range_brackets_truth_and_is_clamped(self):
+        idx = common.volume_index(make_estate(400))
+        pop = sorted(sv.measurable(idx))
+        meas = {v: 20.0 + (i % 5) for i, v in enumerate(pop[::4])}
+        out = extrapolate.estimate(idx, meas)
+        lo, hi = out["range"]["used_pct"]
+        self.assertTrue(0 <= lo <= 22 <= hi <= 100, out)
+        self.assertIn("point-in-time", out["note"])
+
+
+DF = """Filesystem     Type 1-blocks       Used  Available Capacity Mounted on
+/dev/nvme0n1p1 xfs  107361579008 21474836480 85886742528 21% /
+tmpfs          tmpfs  8000000000          0 8000000000  0% /dev/shm
+/dev/nvme1n1   ext4  536603975680 429496729600 107107246080 81% /data
+/dev/mapper/vg-lv xfs 100000000000 50000000000 50000000000 50% /lvm
+"""
+LSBLK = json.dumps({"blockdevices": [
+    {"name": "nvme0n1", "serial": "vol0aaaaaaaaaaaaaaaa", "type": "disk",
+     "children": [{"name": "nvme0n1p1", "serial": None, "type": "part", "mountpoint": "/"}]},
+    {"name": "nvme1n1", "serial": "vol0bbbbbbbbbbbbbbbb", "type": "disk", "mountpoint": "/data"},
+    {"name": "nvme2n1", "serial": "vol0cccccccccccccccc", "type": "disk", "children": [
+        {"name": "vg-lv", "serial": None, "type": "lvm", "mountpoint": "/lvm"}]},
+    {"name": "nvme3n1", "serial": "vol0dddddddddddddddd", "type": "disk", "children": [
+        {"name": "vg-lv", "serial": None, "type": "lvm", "mountpoint": "/lvm"}]},
+]})
+
+
+class LargestExtrapolation(unittest.TestCase):
+    def test_does_not_extrapolate_to_unmeasured_size_bands_or_unreachable(self):
+        # 6 big volumes (all measured) and 40 small ones (none measured), plus 4 big on an unreachable instance
+        spec = {"i-big%d" % i: [2000] for i in range(6)}
+        spec.update({"i-small%d" % i: [20] for i in range(40)})
+        spec.update({"i-gone%d" % i: [2000] for i in range(4)})
+        idx = common.volume_index(disks_estate(spec))
+        reach = {i for i in spec if not i.startswith("i-gone")}
+        meas = {"vol-i-big%d-d0" % i: 30.0 + i for i in range(6)}
+        out = extrapolate.estimate(idx, meas, "largest", reach)
+        self.assertEqual(out["scope_label"], "on SSM-reachable volumes in the size bands that were measured")
+        self.assertEqual(out["total_gib"], 12000)             # only the measured band, reachable only
+        self.assertGreater(out["unmeasured_gib"], 0)
+        self.assertGreater(out["eligible_gib"], out["total_gib"])
+        lo, hi = out["range"]["used_pct"]
+        self.assertTrue(28 <= lo <= hi <= 40, out["range"])    # reflects the big disks, not diluted by the small ones
+        self.assertIn("not a statistical sample", out["note"])
+
+    def test_stratified_strategy_is_unchanged(self):
+        idx = common.volume_index(make_estate(400))
+        pop = sorted(sv.measurable(idx))
+        meas = {v: 20.0 + (i % 5) for i, v in enumerate(pop[::4])}
+        self.assertEqual(extrapolate.estimate(idx, meas)["range"],
+                         extrapolate.estimate(idx, meas, "stratified")["range"])
+
+    def test_no_covered_band_gives_no_range(self):
+        sizes = [30, 100, 150, 500, 600, 2000]                    # bands: <=50 (1), 51-200 (2), 201-1000 (2), >1000 (1)
+        idx = common.volume_index(disks_estate({"i-a%d" % i: [g] for i, g in enumerate(sizes)}))
+        meas = {"vol-i-a%d-d0" % i: 50.0 for i in range(6)}       # no band has the 3 readings needed
+        out = extrapolate.estimate(idx, meas, "largest", None)
+        self.assertIsNone(out["range"])
+
+
+class Parsing(unittest.TestCase):
+    def test_serial_to_volume_id(self):
+        self.assertEqual(cu.vol_from_serial("vol0aaaaaaaaaaaaaaaa"), "vol-0aaaaaaaaaaaaaaaa")
+        self.assertIsNone(cu.vol_from_serial("Amazon EC2 NVMe"))
+
+    def test_parse_ssm_output(self):
+        mounts, note = cu.parse_ssm_output("---DF---\n" + DF + "---LSBLK---\n" + LSBLK)
+        by = {m["mountpoint"]: m for m in mounts}
+        self.assertNotIn("/dev/shm", by)
+        self.assertEqual(by["/"]["volume_id"], "vol-0aaaaaaaaaaaaaaaa")
+        self.assertEqual(by["/data"]["volume_id"], "vol-0bbbbbbbbbbbbbbbb")
+        self.assertEqual(by["/data"]["used_pct"], 80.0)
+        # LVM across two disks is NOT attributed to a single volume
+        self.assertIsNone(by["/lvm"]["volume_id"])
+        self.assertEqual(len(by["/lvm"]["volume_ids"]), 2)
+        self.assertIsNone(note)
+
+    def test_missing_lsblk_is_flagged(self):
+        mounts, note = cu.parse_ssm_output("---DF---\n" + DF + "---LSBLK---\n")
+        self.assertTrue(note)
+        self.assertTrue(all(m["volume_id"] is None for m in mounts))
+
+    def test_name_fallback_only_when_certain(self):
+        m = [{"device": "/dev/xvdf1", "volume_id": None}, {"device": "/dev/xvdg", "volume_id": None}]
+        cu.map_by_name(m, [{"VolumeId": "vol-1", "Device": "/dev/sdf"},
+                           {"VolumeId": "vol-2", "Device": "/dev/xvdg"}, {"VolumeId": "vol-3", "Device": "/dev/xvdg"}])
+        self.assertEqual(m[0]["volume_id"], "vol-1")
+        self.assertIsNone(m[1]["volume_id"])  # ambiguous: two volumes claim xvdg
+
+
+class Budget(unittest.TestCase):
+    def test_cap_is_not_overridable(self):
+        self.assertEqual(common.CostBudget(cap=50).cap, 1.0)
+
+    def test_charge_refuses_over_cap(self):
+        b = common.CostBudget()
+        b.charge("GetMetricData", 99000)  # $0.99
+        with self.assertRaises(common.BudgetExceeded):
+            b.charge("GetMetricData", 2000)
+        self.assertLess(b.spent, 1.0)
+
+    def test_plan_trims_to_fit(self):
+        ws = write_ws(make_estate(40))
+        ids = ["i-%d%05d" % (0, i) for i in range(1, 20)]
+        plan = cu.cw_plan(ws, ids, common.CostBudget(cap=0.00005))
+        self.assertGreater(plan["dropped_to_fit_budget"], 0)
+        self.assertLessEqual(plan["estimated_aws_cost_usd"], 0.00005 + 1e-9)
+
+    def test_five_percent_of_big_estate_is_cheap(self):
+        b = common.CostBudget()
+        self.assertLess(b.estimate({"ListMetrics": 500, "GetMetricData": 1000}), 0.05)
+
+
+class _ClientError(Exception):
+    def __init__(self, code):
+        super().__init__(code)
+        self.response = {"Error": {"Code": code}}
+
+
+class FakeSSM:
+    def __init__(self, managed, outputs, fail_send=False, doc_present=True, tagged=True):
+        self.managed, self.outputs, self.fail_send, self.sent = managed, outputs, fail_send, []
+        self.doc_present, self.tagged, self.created, self.deleted = doc_present, tagged, [], []
+        self.describe_calls = 0
+
+    def describe_document(self, Name):
+        self.describe_calls += 1
+        if not self.doc_present:
+            raise _ClientError("InvalidDocument")
+        return {"Document": {"Name": Name}}
+
+    def create_document(self, **kw):
+        self.created.append(kw)
+        self.doc_present = True
+
+    def list_tags_for_resource(self, ResourceType, ResourceId):
+        return {"TagList": [cu.DOC_TAG] if self.tagged else []}
+
+    def delete_document(self, Name, Force):
+        self.deleted.append(Name)
+
+    def describe_instance_information(self, Filters):
+        ids = Filters[0]["Values"]
+        return {"InstanceInformationList": [
+            {"InstanceId": i, "PingStatus": self.managed[i][0], "PlatformType": self.managed[i][1]}
+            for i in ids if i in self.managed]}
+
+    def send_command(self, **kw):
+        if self.fail_send:
+            raise RuntimeError("boom")
+        self.sent.append(kw)
+        return {"Command": {"CommandId": "c-1"}}
+
+    def get_command_invocation(self, CommandId, InstanceId):
+        st, out = self.outputs[InstanceId]
+        return {"Status": st, "StandardOutputContent": out, "StandardErrorContent": "err" if st != "Success" else ""}
+
+
+class FakeSessions:
+    def __init__(self, **svc):
+        self.svc = svc
+
+    def client(self, service, account, region):
+        return self.svc[service]
+
+
+class SsmRun(unittest.TestCase):
+    def test_statuses_and_fixed_command(self):
+        ws = write_ws(make_estate(40))
+        ids = ["i-000001", "i-000002", "i-000003", "i-000004", "i-000005"]
+        ssm = FakeSSM(
+            managed={"i-000001": ("Online", "Linux"), "i-000002": ("ConnectionLost", "Linux"),
+                     "i-000003": ("Online", "Windows"), "i-000004": ("Online", "Linux")},
+            outputs={"i-000001": ("Success", "---DF---\n" + DF + "---LSBLK---\n" + LSBLK),
+                     "i-000004": ("Failed", "")})
+        stats = cu.run_ssm(ws, ids, FakeSessions(ssm=ssm), poll=0, sleep=lambda s: None)
+        self.assertEqual(stats, {"ok": 1, "failed": 1, "skipped": 3})
+        recs = {r["instance_id"]: r for r in common.read_jsonl(os.path.join(ws, "utilization.jsonl"))}
+        self.assertTrue(recs["i-000005"]["reason"].startswith("not_managed"))
+        self.assertTrue(recs["i-000002"]["reason"].startswith("ssm_offline"))
+        self.assertEqual(recs["i-000003"]["reason"], "windows_unsupported")
+        self.assertEqual(recs["i-000001"]["status"], "ok")
+        # default: the stock document carries ONE fixed command; nothing is created in the account
+        self.assertEqual(len(ssm.sent), 1)
+        self.assertEqual(ssm.sent[0]["DocumentName"], "AWS-RunShellScript")
+        self.assertEqual(ssm.sent[0]["Parameters"], {"commands": [cu.REMOTE_COMMAND]})
+        self.assertEqual(ssm.created, [])
+        self.assertEqual(ssm.describe_calls, 0, "default mode must not even look for the document")
+
+    def test_cumulative_skip(self):
+        ws = write_ws(make_estate(40))
+        cu.record(ws, "i-000001", "111111111111", "us-east-1", "ssm_df", "ok", None, [])
+        self.assertEqual(cu.ssm_plan(ws, ["i-000001", "i-000002"])["instances"], ["i-000002"])
+
+    def test_send_failure_is_recorded_not_raised(self):
+        ws = write_ws(make_estate(40))
+        ssm = FakeSSM({"i-000001": ("Online", "Linux")}, {}, fail_send=True)
+        stats = cu.run_ssm(ws, ["i-000001"], FakeSessions(ssm=ssm), poll=0, sleep=lambda s: None)
+        self.assertEqual(stats["failed"], 1)
+
+    def test_missing_document_is_reported_per_instance_not_sent(self):
+        ws = write_ws(make_estate(40))
+        ssm = FakeSSM({"i-000001": ("Online", "Linux")}, {}, doc_present=False)
+        stats = cu.run_ssm(ws, ["i-000001"], FakeSessions(ssm=ssm), use_document=True, poll=0, sleep=lambda s: None)
+        self.assertEqual(stats["skipped"], 1)
+        self.assertEqual(ssm.sent, [])
+        rec = common.read_jsonl(os.path.join(ws, "utilization.jsonl"))[0]
+        self.assertTrue(rec["reason"].startswith("document_missing"))
+
+    def test_default_mode_works_without_any_document(self):
+        ws = write_ws(make_estate(40))
+        ssm = FakeSSM({"i-000001": ("Online", "Linux")}, {"i-000001": ("Success", "---DF---\n" + DF + "---LSBLK---\n" + LSBLK)},
+                      doc_present=False)
+        stats = cu.run_ssm(ws, ["i-000001"], FakeSessions(ssm=ssm), poll=0, sleep=lambda s: None)
+        self.assertEqual(stats["ok"], 1)
+        self.assertEqual(ssm.sent[0]["DocumentName"], "AWS-RunShellScript")
+
+    def test_document_mode_uses_the_dedicated_document_with_no_free_text(self):
+        ws = write_ws(make_estate(40))
+        ssm = FakeSSM({"i-000001": ("Online", "Linux")}, {"i-000001": ("Success", "---DF---\n" + DF + "---LSBLK---\n" + LSBLK)})
+        cu.run_ssm(ws, ["i-000001"], FakeSessions(ssm=ssm), use_document=True, poll=0, sleep=lambda s: None)
+        self.assertEqual(ssm.sent[0]["DocumentName"], "DatafyDiskUsage")
+        self.assertEqual(ssm.sent[0]["Parameters"], {})
+
+    def test_plan_names_the_document_in_use(self):
+        ws = write_ws(make_estate(40))
+        self.assertEqual(cu.ssm_plan(ws, ["i-000001"])["document"], "AWS-RunShellScript")
+        self.assertEqual(cu.ssm_plan(ws, ["i-000001"], use_document=True)["document"], "DatafyDiskUsage")
+        self.assertIn("Nothing is created", cu.ssm_plan(ws, ["i-000001"])["note"])
+        self.assertIn("deploy-doc", cu.ssm_plan(ws, ["i-000001"], use_document=True)["note"])
+
+    def test_deploy_creates_only_where_missing_with_tag_and_exact_content(self):
+        ws = write_ws(make_estate(40))
+        missing, there = FakeSSM({}, {}, doc_present=False), FakeSSM({}, {}, doc_present=True)
+
+        class PerScope:
+            def client(self, svc, account, region):
+                return missing if account == "111111111111" else there
+        # i-000001 -> account 0 (111...), i-100001 -> account 1 (222...)
+        res = cu.deploy_docs(ws, ["i-000001", "i-100001"], PerScope())
+        self.assertEqual(sorted(res.values()), ["already present", "created"])
+        kw = missing.created[0]
+        self.assertEqual(kw["Name"], "DatafyDiskUsage")
+        self.assertEqual(kw["Tags"], [cu.DOC_TAG])
+        self.assertEqual(json.loads(kw["Content"])["mainSteps"][0]["inputs"]["runCommand"], [cu.REMOTE_COMMAND])
+        self.assertEqual(there.created, [])
+
+    def test_remove_only_deletes_documents_this_tool_created(self):
+        ws = write_ws(make_estate(40))
+        cu.record(ws, "i-000001", "111111111111", "us-east-1", "ssm_df", "ok", None, [])
+        cu.record(ws, "i-100001", "222222222222", "us-east-1", "ssm_df", "ok", None, [])
+        ours, theirs = FakeSSM({}, {}, tagged=True), FakeSSM({}, {}, tagged=False)
+
+        class PerScope:
+            def client(self, svc, account, region):
+                return ours if account == "111111111111" else theirs
+        res = cu.remove_docs(ws, PerScope())
+        self.assertEqual(ours.deleted, ["DatafyDiskUsage"])
+        self.assertEqual(theirs.deleted, [])
+        self.assertIn("left alone", res["222222222222/us-east-1"])
+
+    def test_document_content_matches_cloudformation(self):
+        cfn = open(os.path.join(ROOT, "iam", "datafy-disk-usage.cfn.yaml")).read()
+        self.assertIn(cu.REMOTE_COMMAND, cfn)
+        self.assertEqual(cu.DOC_CONTENT["mainSteps"][0]["inputs"]["runCommand"], [cu.REMOTE_COMMAND])
+
+    def test_ssm_is_the_default_tier(self):
+        import argparse
+        import inspect
+        src = inspect.getsource(cu.main)
+        self.assertIn('default="ssm"', src)
+
+    def test_remote_command_matches_cloudformation_document(self):
+        cfn = open(os.path.join(ROOT, "iam", "datafy-disk-usage.cfn.yaml")).read()
+        line = [l for l in cfn.splitlines() if "---DF---" in l][0].strip()[3:-1]  # strip '- "' and '"'
+        self.assertEqual(line, cu.REMOTE_COMMAND)
+
+    def test_document_only_policy_allows_sendcommand_only_on_our_document(self):
+        pol = json.load(open(os.path.join(ROOT, "iam", "ssm-sendcommand-document-only-policy.json")))
+        send = [s for s in pol["Statement"] if s["Action"] == "ssm:SendCommand"][0]
+        self.assertIn("arn:aws:ssm:*:*:document/DatafyDiskUsage", send["Resource"])
+        self.assertFalse(any("AWS-RunShellScript" in r for r in send["Resource"]))
+
+    def test_default_policy_allows_the_stock_document_and_creates_nothing(self):
+        pol = json.load(open(os.path.join(ROOT, "iam", "ssm-sendcommand-policy.json")))
+        actions = [a for s in pol["Statement"] for a in (s["Action"] if isinstance(s["Action"], list) else [s["Action"]])]
+        self.assertIn("ssm:SendCommand", actions)
+        self.assertFalse([a for a in actions if "Create" in a or "Delete" in a or a.endswith("*")], actions)
+        send = [s for s in pol["Statement"] if s["Action"] == "ssm:SendCommand"][0]
+        self.assertTrue(any("AWS-RunShellScript" in r for r in send["Resource"]))
+
+
+class RoleTemplate(unittest.TestCase):
+    def test_role_stock_document_is_conditional_and_trust_is_management_only(self):
+        t = open(os.path.join(ROOT, "iam", "datafy-explorer-role.cfn.yaml")).read()
+        self.assertIn("document/DatafyDiskUsage", t)
+        # the stock document is only ever granted behind the AllowStock condition, so document-only mode is real
+        stock_lines = [l for l in t.splitlines() if "AWS-RunShellScript" in l and "arn:aws" in l]
+        self.assertEqual(len(stock_lines), 1)
+        self.assertIn("!If [AllowStock", stock_lines[0])
+        # no action wildcard (an ARN like arn:aws:ssm:*:*:document/... is fine)
+        self.assertIsNone(re.search(r"[\[\s,]\w+:\*[\],\s]", t))
+        self.assertNotIn("Action: \"*\"", t)
+        self.assertIn("${ManagementAccountId}:root", t)
+        self.assertEqual(t.count("sts:AssumeRole"), 1)
+
+
+class FakeCW:
+    def __init__(self, with_metrics, per=1):
+        self.with_metrics, self.per, self.calls = with_metrics, per, {"list": 0, "get": 0}
+
+    def list_metrics(self, **kw):
+        self.calls["list"] += 1
+        iid = kw["Dimensions"][0]["Value"]
+        if iid not in self.with_metrics:
+            return {"Metrics": []}
+        return {"Metrics": [{"Namespace": "CWAgent", "MetricName": "disk_used_percent", "Dimensions": [
+            {"Name": "InstanceId", "Value": iid}, {"Name": "path", "Value": "/" if k == 0 else "/m%d" % k},
+            {"Name": "device", "Value": "xvda1" if k == 0 else "xvdz%d" % k}, {"Name": "fstype", "Value": "xfs"}]}
+            for k in range(self.per)]}
+
+    def get_metric_data(self, MetricDataQueries, **kw):
+        self.calls["get"] += 1
+        return {"MetricDataResults": [{"Id": q["Id"], "Values": [42.0]} for q in MetricDataQueries]}
+
+
+class CloudWatchRun(unittest.TestCase):
+    def test_records_and_charges(self):
+        ws = write_ws(make_estate(40))
+        cw, b = FakeCW({"i-000001"}), common.CostBudget()
+        stats = cu.run_cloudwatch(ws, ["i-000001", "i-000002"], FakeSessions(cloudwatch=cw), b)
+        self.assertEqual((stats["ok"], stats["skipped"]), (1, 1))
+        recs = {r["instance_id"]: r for r in common.read_jsonl(os.path.join(ws, "utilization.jsonl"))}
+        self.assertEqual(recs["i-000002"]["reason"], "no_agent_metrics")
+        m = recs["i-000001"]["mounts"][0]
+        self.assertEqual((m["used_pct"], m["volume_id"], m["derived"]), (42.0, "vol-000001", True))
+        self.assertEqual(b.calls, {"ListMetrics": 2, "GetMetricData": 1})
+
+    def test_stops_when_budget_would_be_exceeded(self):
+        ws = write_ws(make_estate(40))
+        # the plan assumes 2 metrics/instance; an instance that really has 3 breaks that assumption
+        b = common.CostBudget(cap=0.00003)
+        stats = cu.run_cloudwatch(ws, ["i-000001"], FakeSessions(cloudwatch=FakeCW({"i-000001"}, per=3)), b)
+        self.assertTrue(stats["stopped_for_budget"])
+        self.assertLessEqual(b.spent, 0.00003 + 1e-12)
+
+
+class Fetch(unittest.TestCase):
+    def test_lock_lists_every_binary_with_a_sha256(self):
+        lock = fetch_scanner.load_lock()
+        self.assertGreaterEqual(len(lock["assets"]), 7)
+        for name, sha in lock["assets"].items():
+            self.assertRegex(sha, r"^[0-9a-f]{64}$", name)
+        self.assertTrue(lock["base_url"].startswith("https://github.com/datafy-io/"))
+
+    def test_checksum_mismatch_refuses(self):
+        class R(io.BytesIO):
+            __enter__ = lambda s: s
+            __exit__ = lambda s, *a: None
+        lock = {"base_url": "https://x/", "assets": {"a.py": hashlib.sha256(b"good").hexdigest()}}
+        d = tempfile.mkdtemp()
+        with self.assertRaises(SystemExit):
+            fetch_scanner.fetch("a.py", d, lock, opener=lambda u: R(b"evil"))
+        self.assertFalse(os.path.exists(os.path.join(d, "a.py")))
+        self.assertTrue(fetch_scanner.fetch("a.py", d, lock, opener=lambda u: R(b"good")))
+
+
+class FetchCertFallback(unittest.TestCase):
+    def test_no_ca_certs_falls_back_to_curl_and_still_verifies(self):
+        import ssl
+        import subprocess
+        import urllib.error
+        from unittest import mock
+        good = b"scanner-bytes"
+        lock = {"base_url": "https://x/", "assets": {"a.py": hashlib.sha256(good).hexdigest()}}
+
+        def no_certs(url):
+            raise urllib.error.URLError(ssl.SSLCertVerificationError("CERTIFICATE_VERIFY_FAILED"))
+
+        def fake_curl(cmd, **kw):
+            open(cmd[cmd.index("-o") + 1], "wb").write(good)
+            return subprocess.CompletedProcess(cmd, 0)
+
+        d = tempfile.mkdtemp()
+        with mock.patch("fetch_scanner.shutil.which", return_value="/usr/bin/curl"), \
+                mock.patch("fetch_scanner.subprocess.run", side_effect=fake_curl) as run:
+            self.assertTrue(fetch_scanner.fetch("a.py", d, lock, opener=no_certs))
+            self.assertIn("--proto", run.call_args[0][0])
+        # and a tampered curl download is still refused
+        with mock.patch("fetch_scanner.shutil.which", return_value="/usr/bin/curl"), \
+                mock.patch("fetch_scanner.subprocess.run",
+                           side_effect=lambda cmd, **kw: (open(cmd[cmd.index("-o") + 1], "wb").write(b"evil"),
+                                                          subprocess.CompletedProcess(cmd, 0))[1]):
+            with self.assertRaises(SystemExit):
+                fetch_scanner.fetch("b.py", tempfile.mkdtemp(),
+                                    {"base_url": "https://x/", "assets": {"b.py": hashlib.sha256(good).hexdigest()}},
+                                    opener=no_certs)
+
+    def test_other_network_errors_do_not_trigger_curl(self):
+        import urllib.error
+        from unittest import mock
+        def refused(url):
+            raise urllib.error.URLError(ConnectionRefusedError())
+        lock = {"base_url": "https://x/", "assets": {"a.py": "0" * 64}}
+        with mock.patch("fetch_scanner.subprocess.run") as run:
+            with self.assertRaises(SystemExit):
+                fetch_scanner.fetch("a.py", tempfile.mkdtemp(), lock, opener=refused)
+            run.assert_not_called()
+
+
+class QueryRunner(unittest.TestCase):
+    def setUp(self):
+        recs = make_estate(20)
+        recs[0]["volumes"][0]["Tags"] = [{"Key": "Team", "Value": "data"}]
+        recs[0]["instances"][0]["Name"] = "web"
+        recs[0]["dlm_policies"] = [{"PolicyId": "policy-1", "Description": "d", "State": "ENABLED", "PolicyType": "X"}]
+        recs[0]["snapshots"] = [{"SnapshotId": "snap-1", "VolumeId": "vol-gone", "VolumeSize": 5,
+                                 "StartTime": "2020-01-01T00:00:00Z", "State": "completed", "Encrypted": False, "Tags": []}]
+        self.ws = write_ws(recs)
+        build_db.build(self.ws)
+        self.db = query.connect(self.ws)
+
+    def test_select_and_formats(self):
+        cols, rows, trunc = query.run(self.db, "SELECT COUNT(*) AS n FROM volumes", 10)
+        self.assertEqual((cols, rows, trunc), (["n"], [(20,)], False))
+        self.assertIn('"n": 20', query.render(cols, rows, "json"))
+        self.assertTrue(query.render(cols, rows, "csv").startswith("n\r\n20"))
+
+    def test_cannot_modify_or_drop(self):
+        for sql in ("DELETE FROM volumes", "DROP TABLE volumes", "UPDATE volumes SET size_gib=0",
+                    "INSERT INTO tags VALUES('a','b','c','d','e','f')", "ATTACH DATABASE '%s' AS x" % os.path.join(self.ws, "other.db"),
+                    "PRAGMA writable_schema=1", "CREATE TABLE t(a)", "VACUUM"):
+            with self.assertRaises(sqlite3.Error, msg=sql):
+                query.run(self.db, sql, 10)
+        self.assertEqual(query.run(self.db, "SELECT COUNT(*) FROM volumes", 1)[1], [(20,)])
+        self.assertFalse(os.path.exists(os.path.join(self.ws, "other.db")), "ATTACH created a file")
+
+    def test_limit_truncates(self):
+        _, rows, trunc = query.run(self.db, "SELECT * FROM volumes", 5)
+        self.assertEqual((len(rows), trunc), (5, True))
+
+    def test_tags_policies_and_views(self):
+        q = lambda sql: query.run(self.db, sql, 50)[1]
+        self.assertEqual(q("SELECT value FROM tags WHERE resource_type='volume' AND key='Team'"), [("data",)])
+        self.assertEqual(len(q("SELECT 1 FROM volumes_full WHERE instance_name='web'")), 1)
+        self.assertEqual(q("SELECT policy_id, state FROM dlm_policies"), [("policy-1", "ENABLED")])
+        self.assertEqual(q("SELECT source_volume_gone FROM snapshot_age WHERE snapshot_id='snap-1'"), [(1,)])
+        self.assertGreater(q("SELECT age_days FROM snapshot_age")[0][0], 365)
+
+    def test_schema_lists_everything(self):
+        out = query.schema(self.db)
+        for name in ("volumes", "tags", "dlm_policies", "backup_plans", "volumes_full", "snapshot_age", "volume_utilization"):
+            self.assertIn(name, out)
+
+    def test_missing_db_is_a_clear_error(self):
+        with self.assertRaises(SystemExit):
+            query.connect(tempfile.mkdtemp())
+
+
+class WorkspaceNesting(unittest.TestCase):
+    def test_running_from_inside_the_workspace_does_not_nest(self):
+        base = tempfile.mkdtemp()
+        inner = os.path.join(base, "datafy-explorer")
+        os.makedirs(inner)
+        open(os.path.join(inner, "discovery.jsonl"), "w").close()
+        old, env = os.getcwd(), os.environ.pop("DATAFY_WORKSPACE", None)
+        try:
+            os.chdir(inner)
+            self.assertEqual(os.path.realpath(common.workspace()), os.path.realpath(inner))
+            self.assertFalse(os.path.exists(os.path.join(inner, "datafy-explorer")))
+            os.chdir(base)
+            self.assertEqual(os.path.realpath(common.workspace()), os.path.realpath(inner))
+        finally:
+            os.chdir(old)
+            if env is not None:
+                os.environ["DATAFY_WORKSPACE"] = env
+
+
+class Db(unittest.TestCase):
+    def test_build_and_join(self):
+        ws = write_ws(make_estate(40))
+        cu.record(ws, "i-000001", "111111111111", "us-east-1", "ssm_df", "ok", None,
+                  [{"mountpoint": "/", "volume_id": "vol-000001", "used_pct": 33.0, "size_bytes": 10, "used_bytes": 3}])
+        path, counts = build_db.build(ws)
+        db = sqlite3.connect(path)
+        self.assertEqual(counts["volumes"], 40)
+        self.assertEqual(db.execute("SELECT used_pct FROM volume_utilization WHERE volume_id='vol-000001'").fetchone()[0], 33.0)
+        self.assertEqual(db.execute("SELECT accounts_total FROM scan_summary").fetchone()[0], 2)
+
+    def test_gaps_are_recorded(self):
+        recs = make_estate(20)
+        recs.insert(0, {"record_type": "account", "account_id": "9", "status": "skipped", "reason": "denied"})
+        recs[1]["status"], recs[1]["errors"] = "partial", ["ec2:DescribeVolumes: AccessDenied"]
+        ws = write_ws(recs)
+        db = sqlite3.connect(build_db.build(ws)[0])
+        kinds = sorted(r[0] for r in db.execute("SELECT kind FROM scan_gaps"))
+        self.assertEqual(kinds, ["account", "region"])
+
+
+if __name__ == "__main__":
+    unittest.main()

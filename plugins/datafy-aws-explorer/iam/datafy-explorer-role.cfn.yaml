@@ -1,0 +1,58 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Datafy AWS Explorer - a least-privilege role the management account assumes in each member
+  account to measure disk utilization (tier 1 CloudWatch, tier 2 SSM). It can read CloudWatch
+  metrics and SSM inventory, and run commands through SSM using the stock AWS-RunShellScript document
+  (default) or, with AllowStockRunShellScript=false, ONLY the dedicated DatafyDiskUsage document. Deploy once per
+  account (IAM is global), as a service-managed StackSet to the whole organization.
+Parameters:
+  ManagementAccountId:
+    Type: String
+    AllowedPattern: "^[0-9]{12}$"
+    Description: The AWS Organizations management account that runs the plugin.
+  AllowStockRunShellScript:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: >
+      true (default): the role may run commands through the stock AWS-RunShellScript document, so nothing has to
+      be created in the account. false: only the dedicated DatafyDiskUsage document (deploy
+      datafy-disk-usage.cfn.yaml too), so IAM enforces that nothing else can run.
+Conditions:
+  AllowStock: !Equals [!Ref AllowStockRunShellScript, "true"]
+Resources:
+  DatafyExplorerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: DatafyExplorerRole
+      MaxSessionDuration: 3600
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { AWS: !Sub "arn:aws:iam::${ManagementAccountId}:root" }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: DatafyExplorerMeasure
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: ReadSsmInventory
+                Effect: Allow
+                Action: [ssm:DescribeInstanceInformation, ssm:DescribeDocument, ssm:ListCommandInvocations, ssm:GetCommandInvocation]
+                Resource: "*"
+              - Sid: RunTheFixedDiskUsageCommand
+                Effect: Allow
+                Action: ssm:SendCommand
+                Resource:
+                  - "arn:aws:ssm:*:*:document/DatafyDiskUsage"
+                  - "arn:aws:ec2:*:*:instance/*"
+                  - !If [AllowStock, "arn:aws:ssm:*::document/AWS-RunShellScript", !Ref "AWS::NoValue"]
+              - Sid: OptionalDeployAndRemoveTheDatafyDiskUsageDocument
+                Effect: Allow
+                Action: [ssm:CreateDocument, ssm:AddTagsToResource, ssm:ListTagsForResource, ssm:DeleteDocument]
+                Resource: "arn:aws:ssm:*:*:document/DatafyDiskUsage"
+              - Sid: ReadCloudWatchAgentDiskMetrics
+                Effect: Allow
+                Action: [cloudwatch:ListMetrics, cloudwatch:GetMetricData]
+                Resource: "*"

@@ -1,0 +1,14 @@
+{
+  "release": "v0.3.1",
+  "tool_version": "0.2.1",
+  "base_url": "https://github.com/datafy-io/datafy-tools/releases/download/v0.3.1/",
+  "assets": {
+    "discovery-aws.py": "e4fc09714b71532ec359db47658f63cb63facdd1bef404fdf227ad76dc7432cb",
+    "discovery-aws-linux-amd64": "b58450b450577cff08a11a3da621071c278e92954afc350e9ef1b6ff61424a94",
+    "discovery-aws-linux-arm64": "998473d791b327c90b037145e9f83833dc437087a282d029a7c14f598c66ea99",
+    "discovery-aws-darwin-arm64": "964b9c8e86a537af77d0c3b17517eca803aebe43057459787e29bde7eb002fb8",
+    "discovery-aws-darwin-amd64": "db0b7a41324d2f197fbbd2b08aedda8fca16072ed51a86a8950d7db60f986c77",
+    "discovery-aws-windows-amd64.exe": "8c1340f6faf2db295e79775b918c7876bdb00c02de80d7f386c297858ec877dc",
+    "discovery-aws-windows-arm64.exe": "05d9173d70583f425e038c4b1ca5bb74b62e354edaaeb036e6fe916ca04fe6fa"
+  }
+}
