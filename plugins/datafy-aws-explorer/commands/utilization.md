@@ -5,8 +5,7 @@ argument-hint: "[--count N | --fraction 0.05]"
 
 Follow the `disk-utilization` skill end to end. Arguments (`$ARGUMENTS`) go to `sample_volumes.py`.
 
-Start by checking that `datafy-explorer/discovery.jsonl` exists. SSM `df` is the default method; CloudWatch is optional. Present the plan, check that the
-`DatafyDiskUsage` document exists (offering to deploy it, with approval, where missing), and obtain an explicit
+Start by checking that `datafy-explorer/discovery.jsonl` exists. SSM `df` is the default method; CloudWatch is optional. Present the plan and obtain an explicit
 yes before any `run ... --yes`, using the plain-language approval message in the skill (instance list, an accurate
 reassurance that only `df` and `lsblk` run, no script names or flags shown to the customer). AWS spend is capped at $1
 (only CloudWatch can bill); the scripts enforce it.

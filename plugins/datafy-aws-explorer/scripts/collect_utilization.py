@@ -5,17 +5,20 @@ Two tiers, both writing utilization.jsonl (one `instance` record per instance):
 
   cloudwatch  Reads disk_used_percent from the CWAgent namespace. Touches no instance.
               Billed (a few cents at most) and bounded by a hard $1 cap.
-  ssm         Runs the fixed DatafyDiskUsage SSM document (df + lsblk) on the instances.
-              Requires explicit approval (--yes). Free of AWS charges.
+  ssm         Runs one fixed read-only command (df + lsblk) on the instances through SSM Run Command, using
+              the stock AWS-RunShellScript document: nothing is created in your account. Requires explicit
+              approval (--yes). Free of AWS charges. (--use-document: use a dedicated DatafyDiskUsage document
+              instead, for customers who want IAM to enforce "this command only".)
 
 Both default to a PLAN: they print what would happen (targets, cost, exact command) and
 change nothing. Add --yes to execute. Nothing is ever sent anywhere but your own AWS.
 
   collect_utilization.py inventory                     which instances can SSM reach? (free, read-only; run before sampling)
   collect_utilization.py plan       [ssm|cloudwatch]   show the plan (no AWS calls). ssm is the default.
+  collect_utilization.py run        [ssm|cloudwatch] --yes
+  Opt-in document mode (--use-document), only if you want IAM-enforced restriction:
   collect_utilization.py check      ssm                is DatafyDiskUsage deployed where we need it? (free)
   collect_utilization.py deploy-doc ssm --yes          create DatafyDiskUsage where missing (approval required)
-  collect_utilization.py run        [ssm|cloudwatch] --yes
   collect_utilization.py remove-doc ssm --yes          delete the documents this tool created
 """
 import argparse
@@ -29,9 +32,9 @@ from common import (BudgetExceeded, CostBudget, INVENTORY_FILE, UTILIZATION_FILE
                     read_jsonl, volume_index, workspace)
 
 DOC_NAME = "DatafyDiskUsage"
-FALLBACK_DOC = "AWS-RunShellScript"
-# The ONLY command this tool ever runs on an instance. Identical to the DatafyDiskUsage
-# document's content (iam/datafy-disk-usage.cfn.yaml); the test suite asserts they match.
+STOCK_DOC = "AWS-RunShellScript"   # default: exists everywhere, so nothing is created in the customer account
+# The ONLY command this tool ever runs on an instance, whichever document carries it. It is also the content of the
+# optional DatafyDiskUsage document (iam/datafy-disk-usage.cfn.yaml); the test suite asserts they match.
 REMOTE_COMMAND = ("echo '---DF---'; df -PT -B1 2>/dev/null; "
                   "echo '---LSBLK---'; lsblk -J -o NAME,SERIAL,SIZE,TYPE,MOUNTPOINT 2>/dev/null || true")
 DOC_TAG = {"Key": "created-by", "Value": "datafy-aws-explorer"}
@@ -298,20 +301,23 @@ def remove_docs(ws, sessions):
             res[key] = "skipped: %s" % _err(e)
     return res
 
-def ssm_plan(ws, instance_ids, use_fallback=False):
+def ssm_plan(ws, instance_ids, use_document=False):
     todo = [i for i in instance_ids if i not in already_done(ws, "ssm_df")]
     scopes, unknown = targets_by_scope(ws, todo)
     return {
-        "tier": "ssm", "document": FALLBACK_DOC if use_fallback else DOC_NAME,
+        "tier": "ssm", "document": DOC_NAME if use_document else STOCK_DOC,
         "command": REMOTE_COMMAND, "instances": todo, "skipped_already_done": len(instance_ids) - len(todo),
         "unknown_instances": unknown, "scopes": {"%s/%s" % k: v for k, v in scopes.items()},
         "estimated_aws_cost_usd": 0.0,
-        "note": "SSM Run Command is free. Output is returned inline, never written to S3.",
+        "note": ("SSM Run Command is free. Output is returned inline, never written to S3. Nothing is created in the account."
+                 if not use_document else
+                 "Document mode: DatafyDiskUsage must exist in each account/region in 'scopes': run `check ssm`, "
+                 "then `deploy-doc ssm --yes` if missing."),
     }
 
 
-def run_ssm(ws, instance_ids, sessions, use_fallback=False, poll=2.0, timeout=120, sleep=time.sleep):
-    plan = ssm_plan(ws, instance_ids, use_fallback)
+def run_ssm(ws, instance_ids, sessions, use_document=False, poll=2.0, timeout=120, sleep=time.sleep):
+    plan = ssm_plan(ws, instance_ids, use_document)
     idx = volume_index(read_discovery(ws))
     attached = {}
     for e in idx.values():
@@ -347,7 +353,7 @@ def run_ssm(ws, instance_ids, sessions, use_fallback=False, poll=2.0, timeout=12
                 stats["skipped"] += 1
             else:
                 ready.append(iid)
-        if ready and not use_fallback:
+        if ready and use_document:
             st = doc_state(ssm)
             if st != "present":
                 for iid in ready:
@@ -358,7 +364,7 @@ def run_ssm(ws, instance_ids, sessions, use_fallback=False, poll=2.0, timeout=12
         for i in range(0, len(ready), SSM_BATCH):
             batch = ready[i:i + SSM_BATCH]
             try:
-                params = {"commands": [REMOTE_COMMAND]} if use_fallback else {}
+                params = {} if use_document else {"commands": [REMOTE_COMMAND]}
                 cmd = ssm.send_command(InstanceIds=batch, DocumentName=plan["document"], Parameters=params,
                                        Comment="Datafy disk utilization (read-only)", TimeoutSeconds=60)
                 cid = cmd["Command"]["CommandId"]
@@ -532,8 +538,9 @@ def main(argv=None):
     ap.add_argument("--role", default="OrganizationAccountAccessRole")
     ap.add_argument("--instances", help="comma-separated instance ids (default: sample.json)")
     ap.add_argument("--yes", action="store_true", help="approve and execute")
-    ap.add_argument("--use-aws-runshellscript", action="store_true",
-                    help="use the stock AWS-RunShellScript document if DatafyDiskUsage is not deployed")
+    ap.add_argument("--use-document", action="store_true",
+                    help="run through the dedicated DatafyDiskUsage document (must be deployed) instead of the "
+                         "stock AWS-RunShellScript; lets IAM enforce that only this command can run")
     a = ap.parse_args(argv)
     ws = workspace(a.workspace)
     if a.action == "inventory":
@@ -563,7 +570,7 @@ def main(argv=None):
         else:
             print(json.dumps(remove_docs(ws, Sessions(a.profile, a.role)), indent=1))
         return
-    plan = cw_plan(ws, ids, budget) if a.tier == "cloudwatch" else ssm_plan(ws, ids, a.use_aws_runshellscript)
+    plan = cw_plan(ws, ids, budget) if a.tier == "cloudwatch" else ssm_plan(ws, ids, a.use_document)
     if a.action == "plan" or not a.yes:
         print(json.dumps(plan, indent=1))
         if a.action == "run":
@@ -573,7 +580,7 @@ def main(argv=None):
     if a.tier == "cloudwatch":
         stats = run_cloudwatch(ws, ids, sessions, budget)
     else:
-        stats = run_ssm(ws, ids, sessions, a.use_aws_runshellscript)
+        stats = run_ssm(ws, ids, sessions, a.use_document)
     print(json.dumps(stats))
 
 

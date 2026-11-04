@@ -268,8 +268,10 @@ class FakeSSM:
     def __init__(self, managed, outputs, fail_send=False, doc_present=True, tagged=True):
         self.managed, self.outputs, self.fail_send, self.sent = managed, outputs, fail_send, []
         self.doc_present, self.tagged, self.created, self.deleted = doc_present, tagged, [], []
+        self.describe_calls = 0
 
     def describe_document(self, Name):
+        self.describe_calls += 1
         if not self.doc_present:
             raise _ClientError("InvalidDocument")
         return {"Document": {"Name": Name}}
@@ -325,10 +327,12 @@ class SsmRun(unittest.TestCase):
         self.assertTrue(recs["i-000002"]["reason"].startswith("ssm_offline"))
         self.assertEqual(recs["i-000003"]["reason"], "windows_unsupported")
         self.assertEqual(recs["i-000001"]["status"], "ok")
-        # only the fixed document was ever invoked
+        # default: the stock document carries ONE fixed command; nothing is created in the account
         self.assertEqual(len(ssm.sent), 1)
-        self.assertEqual(ssm.sent[0]["DocumentName"], "DatafyDiskUsage")
-        self.assertNotIn("commands", ssm.sent[0]["Parameters"])
+        self.assertEqual(ssm.sent[0]["DocumentName"], "AWS-RunShellScript")
+        self.assertEqual(ssm.sent[0]["Parameters"], {"commands": [cu.REMOTE_COMMAND]})
+        self.assertEqual(ssm.created, [])
+        self.assertEqual(ssm.describe_calls, 0, "default mode must not even look for the document")
 
     def test_cumulative_skip(self):
         ws = write_ws(make_estate(40))
@@ -344,11 +348,33 @@ class SsmRun(unittest.TestCase):
     def test_missing_document_is_reported_per_instance_not_sent(self):
         ws = write_ws(make_estate(40))
         ssm = FakeSSM({"i-000001": ("Online", "Linux")}, {}, doc_present=False)
-        stats = cu.run_ssm(ws, ["i-000001"], FakeSessions(ssm=ssm), poll=0, sleep=lambda s: None)
+        stats = cu.run_ssm(ws, ["i-000001"], FakeSessions(ssm=ssm), use_document=True, poll=0, sleep=lambda s: None)
         self.assertEqual(stats["skipped"], 1)
         self.assertEqual(ssm.sent, [])
         rec = common.read_jsonl(os.path.join(ws, "utilization.jsonl"))[0]
         self.assertTrue(rec["reason"].startswith("document_missing"))
+
+    def test_default_mode_works_without_any_document(self):
+        ws = write_ws(make_estate(40))
+        ssm = FakeSSM({"i-000001": ("Online", "Linux")}, {"i-000001": ("Success", "---DF---\n" + DF + "---LSBLK---\n" + LSBLK)},
+                      doc_present=False)
+        stats = cu.run_ssm(ws, ["i-000001"], FakeSessions(ssm=ssm), poll=0, sleep=lambda s: None)
+        self.assertEqual(stats["ok"], 1)
+        self.assertEqual(ssm.sent[0]["DocumentName"], "AWS-RunShellScript")
+
+    def test_document_mode_uses_the_dedicated_document_with_no_free_text(self):
+        ws = write_ws(make_estate(40))
+        ssm = FakeSSM({"i-000001": ("Online", "Linux")}, {"i-000001": ("Success", "---DF---\n" + DF + "---LSBLK---\n" + LSBLK)})
+        cu.run_ssm(ws, ["i-000001"], FakeSessions(ssm=ssm), use_document=True, poll=0, sleep=lambda s: None)
+        self.assertEqual(ssm.sent[0]["DocumentName"], "DatafyDiskUsage")
+        self.assertEqual(ssm.sent[0]["Parameters"], {})
+
+    def test_plan_names_the_document_in_use(self):
+        ws = write_ws(make_estate(40))
+        self.assertEqual(cu.ssm_plan(ws, ["i-000001"])["document"], "AWS-RunShellScript")
+        self.assertEqual(cu.ssm_plan(ws, ["i-000001"], use_document=True)["document"], "DatafyDiskUsage")
+        self.assertIn("Nothing is created", cu.ssm_plan(ws, ["i-000001"])["note"])
+        self.assertIn("deploy-doc", cu.ssm_plan(ws, ["i-000001"], use_document=True)["note"])
 
     def test_deploy_creates_only_where_missing_with_tag_and_exact_content(self):
         ws = write_ws(make_estate(40))
@@ -396,18 +422,29 @@ class SsmRun(unittest.TestCase):
         line = [l for l in cfn.splitlines() if "---DF---" in l][0].strip()[3:-1]  # strip '- "' and '"'
         self.assertEqual(line, cu.REMOTE_COMMAND)
 
-    def test_policy_allows_sendcommand_only_on_our_document(self):
-        pol = json.load(open(os.path.join(ROOT, "iam", "ssm-sendcommand-policy.json")))
+    def test_document_only_policy_allows_sendcommand_only_on_our_document(self):
+        pol = json.load(open(os.path.join(ROOT, "iam", "ssm-sendcommand-document-only-policy.json")))
         send = [s for s in pol["Statement"] if s["Action"] == "ssm:SendCommand"][0]
         self.assertIn("arn:aws:ssm:*:*:document/DatafyDiskUsage", send["Resource"])
         self.assertFalse(any("AWS-RunShellScript" in r for r in send["Resource"]))
 
+    def test_default_policy_allows_the_stock_document_and_creates_nothing(self):
+        pol = json.load(open(os.path.join(ROOT, "iam", "ssm-sendcommand-policy.json")))
+        actions = [a for s in pol["Statement"] for a in (s["Action"] if isinstance(s["Action"], list) else [s["Action"]])]
+        self.assertIn("ssm:SendCommand", actions)
+        self.assertFalse([a for a in actions if "Create" in a or "Delete" in a or a.endswith("*")], actions)
+        send = [s for s in pol["Statement"] if s["Action"] == "ssm:SendCommand"][0]
+        self.assertTrue(any("AWS-RunShellScript" in r for r in send["Resource"]))
+
 
 class RoleTemplate(unittest.TestCase):
-    def test_role_runs_only_our_document_and_trusts_only_the_management_account(self):
+    def test_role_stock_document_is_conditional_and_trust_is_management_only(self):
         t = open(os.path.join(ROOT, "iam", "datafy-explorer-role.cfn.yaml")).read()
         self.assertIn("document/DatafyDiskUsage", t)
-        self.assertNotIn("AWS-RunShellScript", t)
+        # the stock document is only ever granted behind the AllowStock condition, so document-only mode is real
+        stock_lines = [l for l in t.splitlines() if "AWS-RunShellScript" in l and "arn:aws" in l]
+        self.assertEqual(len(stock_lines), 1)
+        self.assertIn("!If [AllowStock", stock_lines[0])
         # no action wildcard (an ARN like arn:aws:ssm:*:*:document/... is fine)
         self.assertIsNone(re.search(r"[\[\s,]\w+:\*[\],\s]", t))
         self.assertNotIn("Action: \"*\"", t)

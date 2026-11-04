@@ -7,30 +7,18 @@
       "Action": [
         "ssm:DescribeInstanceInformation",
         "ssm:ListCommandInvocations",
-        "ssm:GetCommandInvocation",
-        "ssm:DescribeDocument"
+        "ssm:GetCommandInvocation"
       ],
       "Resource": "*"
     },
     {
-      "Sid": "RunOnlyTheDatafyDiskUsageDocument",
+      "Sid": "RunCommandWithTheStockShellDocument",
       "Effect": "Allow",
       "Action": "ssm:SendCommand",
       "Resource": [
-        "arn:aws:ssm:*:*:document/DatafyDiskUsage",
+        "arn:aws:ssm:*::document/AWS-RunShellScript",
         "arn:aws:ec2:*:*:instance/*"
       ]
-    },
-    {
-      "Sid": "OptionalDeployAndRemoveTheDatafyDiskUsageDocument",
-      "Effect": "Allow",
-      "Action": [
-        "ssm:CreateDocument",
-        "ssm:AddTagsToResource",
-        "ssm:ListTagsForResource",
-        "ssm:DeleteDocument"
-      ],
-      "Resource": "arn:aws:ssm:*:*:document/DatafyDiskUsage"
     }
   ]
 }

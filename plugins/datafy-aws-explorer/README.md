@@ -27,9 +27,7 @@ Needs Python 3.9+, `boto3` (`pip install boto3`), and AWS credentials for your m
 | Discover | Scanner runs read-only across the Organization | Confirm the account; asked before `--setup-role` |
 | SSM inventory | Lists which running Linux instances SSM can reach. Free, read-only, runs nothing on them | none |
 | Sample | Among reachable instances, the ones with the **biggest data disks** first, about 5% of volumes (min 10, max 500) | Shown to you |
-| Document check | Looks for the read-only `DatafyDiskUsage` SSM document in each account/region (free) | Shown to you |
-| Deploy document (only if missing) | Creates that one document, tagged, and offers to delete it afterwards | **Explicit yes**, per run |
-| `df` over SSM (default) | Runs one fixed read-only command on the sampled instances | **Explicit yes**, with the instance list and a plain-language explanation. Only `df` and `lsblk` run, and the exact command is shown on request |
+| `df` over SSM (default) | Runs one fixed read-only command on the sampled instances. **Nothing is created in your account.** | **Explicit yes**, with the instance list and a plain-language explanation. Only `df` and `lsblk` run, and the exact command is shown on request |
 | CloudWatch (optional) | Reads `disk_used_percent`; touches no instance | Cost shown first; **hard cap $1** |
 | Dashboard | Static HTML file written locally | none |
 
@@ -58,8 +56,8 @@ The plugin never spends more than **$1** of your AWS money in a run, enforced in
 | Call | Used for | Cost |
 |---|---|---|
 | EC2 `Describe*`, Organizations `List*`, STS | Scanner | Free |
-| `ssm:DescribeInstanceInformation`, `DescribeDocument`, `SendCommand`, `GetCommandInvocation` | SSM `df` | Free. Output returned inline, never to S3 |
-| `ssm:CreateDocument`, `DeleteDocument` (+ tags) | Optional: deploy/remove `DatafyDiskUsage`, only that document | Free |
+| `ssm:DescribeInstanceInformation`, `SendCommand` (stock `AWS-RunShellScript`), `GetCommandInvocation` | SSM `df` | Free. Output returned inline, never to S3 |
+| `ssm:DescribeDocument`, `CreateDocument`, `DeleteDocument` (+ tags) | Only in the opt-in document mode, for `DatafyDiskUsage` | Free |
 | `cloudwatch:ListMetrics` | CloudWatch (optional) | ~$0.01 per 1,000 requests |
 | `cloudwatch:GetMetricData` | CloudWatch (optional) | ~$0.01 per 1,000 metrics |
 
@@ -67,29 +65,33 @@ For scale: 5% of a 4,000-volume estate is ≈200 volumes, a fraction of a cent. 
 
 ## Setting up SSM `df`
 
-`ssm:SendCommand` can run arbitrary commands unless you restrict it. So the plugin ships a **fixed document**:
+Nothing needs to be deployed. The plugin runs one fixed command (`df -PT -B1` and `lsblk`) through SSM Run Command
+using the stock `AWS-RunShellScript` document, which exists in every account. The command appears in SSM's command
+history, which is your audit trail. Instances must be SSM-managed (agent + instance profile); those that aren't are
+reported with the reason, never skipped silently.
 
-1. **Easiest:** let the plugin create it, with your approval, only in the accounts/regions it needs, and delete it afterwards. Or deploy [`iam/datafy-disk-usage.cfn.yaml`](iam/datafy-disk-usage.cfn.yaml) in each account/region you want to measure.
-   It creates `DatafyDiskUsage`, which runs only `df -PT -B1` and `lsblk`.
-2. Grant the identity running the plugin [`iam/ssm-sendcommand-policy.json`](iam/ssm-sendcommand-policy.json):
-   `SendCommand` is allowed **on that document only**.
-3. Instances must be SSM-managed (agent + instance profile). Those that aren't are reported with the reason,
-   never skipped silently.
+The plugin only ever sends that one command, and its tests check that. AWS itself cannot enforce that, though:
+the identity running the plugin needs `ssm:SendCommand` on `AWS-RunShellScript`, which could run any command.
+Grant only [`iam/ssm-sendcommand-policy.json`](iam/ssm-sendcommand-policy.json).
+
+**If your security team wants IAM to enforce "this command only"**, use the opt-in document mode: deploy
+[`iam/datafy-disk-usage.cfn.yaml`](iam/datafy-disk-usage.cfn.yaml) (it creates `DatafyDiskUsage`, which runs only that
+command) and grant [`iam/ssm-sendcommand-document-only-policy.json`](iam/ssm-sendcommand-document-only-policy.json), where
+`SendCommand` is allowed on that document only. The plugin can create and later delete the document itself, with your
+approval, and runs with `--use-document`.
 
 ### Org-wide: running from the management account
 
-The plugin runs from your **management (admin) account** and reaches every member account by assuming a role.
-For SSM `df` (and optionally CloudWatch) that role must be able to use SSM, and the `DatafyDiskUsage` document must exist in
-each account **and region** you measure. Two options:
+The plugin runs from your **management (admin) account** and reaches every member account by assuming a role that
+can use SSM:
 
-- **Quick:** use `OrganizationAccountAccessRole` (`--role OrganizationAccountAccessRole`, the default). It is
-  full-admin in each account, so you give up least privilege, and you still deploy the document yourself.
-- **Least privilege (recommended):** deploy two templates as **service-managed StackSets** to the organization:
-  [`iam/datafy-explorer-role.cfn.yaml`](iam/datafy-explorer-role.cfn.yaml) (once per account; takes your
-  `ManagementAccountId`) and [`iam/datafy-disk-usage.cfn.yaml`](iam/datafy-disk-usage.cfn.yaml) (every region you
-  measure). Then pass `--role DatafyExplorerRole`.
-- **The management account itself is not covered by a service-managed StackSet.** Deploy both templates there as
-  ordinary stacks. The role is not needed there, since you are already that identity.
+- **Quick:** `OrganizationAccountAccessRole` (the default). It is full-admin in each account, so you give up least
+  privilege.
+- **Least privilege (recommended):** deploy [`iam/datafy-explorer-role.cfn.yaml`](iam/datafy-explorer-role.cfn.yaml) as a
+  **service-managed StackSet** to the organization (takes your `ManagementAccountId`; set `AllowStockRunShellScript`
+  to `false` for document-only mode), then pass `--role DatafyExplorerRole`.
+- **The management account itself is not covered by a service-managed StackSet.** You are already that identity there,
+  so no role is needed.
 
 The scanner's temporary `--setup-role` creates `DatafyDiscoveryRole`, which is read-only EC2 access and is
 **deleted after the scan**, so it cannot be reused for utilization.
