@@ -3,7 +3,7 @@
 A Claude Code plugin that helps you explore your own AWS estate:
 
 - **`/datafy-aws-explorer:discover`** runs the read-only [Datafy discovery scanner](../../discovery-tool/aws/) across your AWS Organization.
-- **Ask questions** about the results in plain language ("which unattached gp2 volumes are over 500 GiB?").
+- **Ask anything about the results, in the session, in plain language** ("which unattached gp2 volumes are over 500 GiB?", "which accounts have no backups?"), with follow-ups. Claude writes read-only SQL against a local database, so the dashboard is optional, not the only way to see your data.
 - **`/datafy-aws-explorer:utilization`** measures real disk utilization on a 5% sample of your volumes: CloudWatch first, then, only with your approval, `df` over SSM.
 - **`/datafy-aws-explorer:dashboard`** builds an offline HTML dashboard from whatever data exists, at any point.
 
@@ -17,7 +17,7 @@ A Claude Code plugin that helps you explore your own AWS estate:
 /plugin install datafy-aws-explorer@datafy-tools
 ```
 
-Needs Python 3.9+, `boto3` (`pip install boto3`), the `sqlite3` CLI, and AWS credentials for your management account
+Needs Python 3.9+, `boto3` (`pip install boto3`), and AWS credentials for your management account
 (the same requirements as the scanner; see its [IAM section](../../discovery-tool/aws/README.md#iam-permissions)).
 
 ## What you will be asked, and when

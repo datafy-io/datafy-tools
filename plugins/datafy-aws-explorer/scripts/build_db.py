@@ -30,7 +30,19 @@ CREATE TABLE utilization_instances(instance_id TEXT, account_id TEXT, region TEX
   status TEXT, reason TEXT, collected_at TEXT);
 CREATE TABLE utilization_mounts(instance_id TEXT, volume_id TEXT, source TEXT, mountpoint TEXT, device TEXT,
   fstype TEXT, size_bytes INT, used_bytes INT, avail_bytes INT, used_pct REAL, collected_at TEXT);
+CREATE TABLE tags(resource_type TEXT, resource_id TEXT, account_id TEXT, region TEXT, key TEXT, value TEXT);
+CREATE TABLE dlm_policies(account_id TEXT, region TEXT, policy_id TEXT, description TEXT, state TEXT,
+  policy_type TEXT, raw TEXT);
+CREATE TABLE backup_plans(account_id TEXT, region TEXT, plan_id TEXT, plan_name TEXT, raw TEXT);
 CREATE TABLE enrichment(kind TEXT, key TEXT, account_id TEXT, region TEXT, data TEXT);
+CREATE VIEW volumes_full AS
+  SELECT v.*, i.name AS instance_name, i.instance_type, i.state AS instance_state, i.platform AS instance_platform,
+         (v.device = i.root_device) AS is_root, (v.instance_id IS NULL) AS is_unattached
+  FROM volumes v LEFT JOIN instances i ON i.instance_id = v.instance_id;
+CREATE VIEW snapshot_age AS
+  SELECT s.*, CAST(julianday('now') - julianday(s.start_time) AS INT) AS age_days,
+         (s.volume_id IS NOT NULL AND s.volume_id NOT IN (SELECT volume_id FROM volumes)) AS source_volume_gone
+  FROM snapshots s;
 CREATE VIEW volume_utilization AS
   SELECT v.*, m.mountpoint, m.fstype, m.used_bytes, m.size_bytes AS fs_size_bytes, m.used_pct, m.source AS util_source
   FROM volumes v LEFT JOIN utilization_mounts m ON m.volume_id = v.volume_id;
@@ -68,6 +80,19 @@ def build(ws):
                     v["VolumeId"], a, g, v.get("Name"), v.get("Size"), v.get("VolumeType"), v.get("State"),
                     v.get("Iops"), v.get("Throughput"), int(bool(v.get("Encrypted"))), v.get("AvailabilityZone"),
                     v.get("SnapshotId"), v.get("InstanceId"), v.get("Device"), j(v.get("Tags"))))
+            for kind, rid_key, items in (("volume", "VolumeId", r.get("volumes", [])),
+                                         ("instance", "InstanceId", r.get("instances", [])),
+                                         ("snapshot", "SnapshotId", r.get("snapshots", []))):
+                for it in items:
+                    for t in it.get("Tags") or []:
+                        db.execute("INSERT INTO tags VALUES(?,?,?,?,?,?)",
+                                   (kind, it.get(rid_key), a, g, t.get("Key"), t.get("Value")))
+            for d in r.get("dlm_policies", []):
+                db.execute("INSERT INTO dlm_policies VALUES(?,?,?,?,?,?,?)", (
+                    a, g, d.get("PolicyId"), d.get("Description"), d.get("State"), d.get("PolicyType"), j(d)))
+            for b in r.get("backup_plans", []):
+                db.execute("INSERT INTO backup_plans VALUES(?,?,?,?,?)", (
+                    a, g, b.get("BackupPlanId"), b.get("BackupPlanName"), j(b)))
             for i in r.get("instances", []):
                 db.execute("INSERT OR REPLACE INTO instances VALUES(?,?,?,?,?,?,?,?,?,?,?,?)", (
                     i["InstanceId"], a, g, i.get("Name"), i.get("InstanceType"), i.get("State"),

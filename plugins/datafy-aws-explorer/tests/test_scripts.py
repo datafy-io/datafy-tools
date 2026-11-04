@@ -13,6 +13,7 @@ import build_db
 import collect_utilization as cu
 import common
 import extrapolate
+import query
 import fetch_scanner
 import sample_volumes as sv
 
@@ -328,6 +329,55 @@ class FetchCertFallback(unittest.TestCase):
             with self.assertRaises(SystemExit):
                 fetch_scanner.fetch("a.py", tempfile.mkdtemp(), lock, opener=refused)
             run.assert_not_called()
+
+
+class QueryRunner(unittest.TestCase):
+    def setUp(self):
+        recs = make_estate(20)
+        recs[0]["volumes"][0]["Tags"] = [{"Key": "Team", "Value": "data"}]
+        recs[0]["instances"][0]["Name"] = "web"
+        recs[0]["dlm_policies"] = [{"PolicyId": "policy-1", "Description": "d", "State": "ENABLED", "PolicyType": "X"}]
+        recs[0]["snapshots"] = [{"SnapshotId": "snap-1", "VolumeId": "vol-gone", "VolumeSize": 5,
+                                 "StartTime": "2020-01-01T00:00:00Z", "State": "completed", "Encrypted": False, "Tags": []}]
+        self.ws = write_ws(recs)
+        build_db.build(self.ws)
+        self.db = query.connect(self.ws)
+
+    def test_select_and_formats(self):
+        cols, rows, trunc = query.run(self.db, "SELECT COUNT(*) AS n FROM volumes", 10)
+        self.assertEqual((cols, rows, trunc), (["n"], [(20,)], False))
+        self.assertIn('"n": 20', query.render(cols, rows, "json"))
+        self.assertTrue(query.render(cols, rows, "csv").startswith("n\r\n20"))
+
+    def test_cannot_modify_or_drop(self):
+        for sql in ("DELETE FROM volumes", "DROP TABLE volumes", "UPDATE volumes SET size_gib=0",
+                    "INSERT INTO tags VALUES('a','b','c','d','e','f')", "ATTACH DATABASE '%s' AS x" % os.path.join(self.ws, "other.db"),
+                    "PRAGMA writable_schema=1", "CREATE TABLE t(a)", "VACUUM"):
+            with self.assertRaises(sqlite3.Error, msg=sql):
+                query.run(self.db, sql, 10)
+        self.assertEqual(query.run(self.db, "SELECT COUNT(*) FROM volumes", 1)[1], [(20,)])
+        self.assertFalse(os.path.exists(os.path.join(self.ws, "other.db")), "ATTACH created a file")
+
+    def test_limit_truncates(self):
+        _, rows, trunc = query.run(self.db, "SELECT * FROM volumes", 5)
+        self.assertEqual((len(rows), trunc), (5, True))
+
+    def test_tags_policies_and_views(self):
+        q = lambda sql: query.run(self.db, sql, 50)[1]
+        self.assertEqual(q("SELECT value FROM tags WHERE resource_type='volume' AND key='Team'"), [("data",)])
+        self.assertEqual(len(q("SELECT 1 FROM volumes_full WHERE instance_name='web'")), 1)
+        self.assertEqual(q("SELECT policy_id, state FROM dlm_policies"), [("policy-1", "ENABLED")])
+        self.assertEqual(q("SELECT source_volume_gone FROM snapshot_age WHERE snapshot_id='snap-1'"), [(1,)])
+        self.assertGreater(q("SELECT age_days FROM snapshot_age")[0][0], 365)
+
+    def test_schema_lists_everything(self):
+        out = query.schema(self.db)
+        for name in ("volumes", "tags", "dlm_policies", "backup_plans", "volumes_full", "snapshot_age", "volume_utilization"):
+            self.assertIn(name, out)
+
+    def test_missing_db_is_a_clear_error(self):
+        with self.assertRaises(SystemExit):
+            query.connect(tempfile.mkdtemp())
 
 
 class Db(unittest.TestCase):
