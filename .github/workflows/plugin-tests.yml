@@ -12,12 +12,26 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
       - name: Validate manifests
         run: |
           python3 -c "import json; json.load(open('.claude-plugin/marketplace.json')); json.load(open('plugins/datafy-aws-explorer/.claude-plugin/plugin.json')); json.load(open('plugins/datafy-aws-explorer/scanner.lock.json'))"
+      # Claude Code caches an installed plugin by version, so shipping changed files under an unchanged
+      # version means customers silently keep running the old code. Require a bump.
+      - name: Plugin version must change when plugin files change
+        if: github.event_name == 'pull_request'
+        run: |
+          base="origin/${{ github.base_ref }}"
+          if ! git diff --quiet "$base"...HEAD -- plugins/datafy-aws-explorer ':!plugins/datafy-aws-explorer/tests'; then
+            old=$(git show "$base":plugins/datafy-aws-explorer/.claude-plugin/plugin.json 2>/dev/null | python3 -c "import json,sys; print(json.load(sys.stdin)['version'])" || echo none)
+            new=$(python3 -c "import json; print(json.load(open('plugins/datafy-aws-explorer/.claude-plugin/plugin.json'))['version'])")
+            echo "base version: $old, this PR: $new"
+            [ "$old" != "$new" ] || { echo "::error::plugin files changed but plugin.json version did not. Bump it so installed copies update."; exit 1; }
+          fi
       - name: Tests (includes the no-calling-home and cost-budget guards)
         working-directory: plugins/datafy-aws-explorer/tests
         run: python3 -m unittest discover -p "test_*.py" -v

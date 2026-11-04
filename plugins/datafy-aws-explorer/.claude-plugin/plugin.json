@@ -1,6 +1,6 @@
 {
   "name": "datafy-aws-explorer",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Explore your AWS estate with the read-only Datafy discovery scan, ask questions about it, sample real disk utilization, and build an offline dashboard. Runs on your machine; nothing is sent to Datafy.",
   "author": { "name": "Datafy", "url": "https://datafy.io" },
   "homepage": "https://github.com/datafy-io/datafy-tools/tree/master/plugins/datafy-aws-explorer",
