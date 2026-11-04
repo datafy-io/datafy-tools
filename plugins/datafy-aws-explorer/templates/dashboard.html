@@ -2669,7 +2669,7 @@ function uxNudge(U, hasRange) {
   return '<div class="ux-nudge"><b>' + lead + 'Measure ' + remaining.toLocaleString() + ' ' +
     (U.measuredEligible.length ? 'more ' : '') + 'volumes to firm this up.</b> ' +
     'That is the 5% sample (at least ' + UX_FLOOR + ', at most ' + UX_CEILING + '). Run ' +
-    '<span class="ux-code">/datafy:utilization</span> in Claude Code: it proposes a representative sample, ' +
+    '<span class="ux-code">/datafy-aws-explorer:utilization</span> in Claude Code: it proposes a representative sample, ' +
     'shows the cost (never above $1) and the exact command, and asks before it touches any instance.</div>';
 }
 

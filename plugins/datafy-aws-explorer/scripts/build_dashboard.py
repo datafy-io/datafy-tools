@@ -54,7 +54,7 @@ def js_json(obj):
 def build_embed(ws):
     path = os.path.join(ws, DISCOVERY_FILE)
     if not os.path.exists(path):
-        raise SystemExit("no %s in %s; run /datafy:discover first" % (DISCOVERY_FILE, ws))
+        raise SystemExit("no %s in %s; run /datafy-aws-explorer:discover first" % (DISCOVERY_FILE, ws))
     with open(path, encoding="utf-8") as f:
         discovery = f.read()
     idx = volume_index(read_discovery(ws))

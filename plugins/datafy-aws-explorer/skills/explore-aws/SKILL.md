@@ -11,7 +11,7 @@ conversation to answer the customer's questions is fine.
 
 ## Before answering anything
 
-1. If `datafy-explorer/discovery.jsonl` is missing, tell the customer to run `/datafy:discover` first.
+1. If `datafy-explorer/discovery.jsonl` is missing, tell the customer to run `/datafy-aws-explorer:discover` first.
 2. Rebuild the database if the JSONL files are newer: `python3 ${CLAUDE_PLUGIN_ROOT}/scripts/build_db.py`.
 3. **Check coverage before you conclude anything.** Run
    `SELECT * FROM scan_summary; SELECT kind, account_id, region, status, detail FROM scan_gaps;`
@@ -52,6 +52,6 @@ Useful starting queries:
   and say it is a ~95% range from a single point-in-time snapshot with no growth data.
 - Cloudwatch-sourced bytes are *derived* from the provisioned size × a percentage: say "approximately".
 - Unattached volumes and volumes on stopped instances cannot be measured; they are not "0% used".
-- After answering, if utilization coverage is under the 5% target, suggest `/datafy:utilization` once.
+- After answering, if utilization coverage is under the 5% target, suggest `/datafy-aws-explorer:utilization` once.
   Do not repeat the suggestion if the customer declined (see `.declined.json`).
-- Offer `/datafy:dashboard` when the customer wants something shareable.
+- Offer `/datafy-aws-explorer:dashboard` when the customer wants something shareable.

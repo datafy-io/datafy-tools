@@ -2,10 +2,10 @@
 
 A Claude Code plugin that helps you explore your own AWS estate:
 
-- **`/datafy:discover`** runs the read-only [Datafy discovery scanner](../../discovery-tool/aws/) across your AWS Organization.
+- **`/datafy-aws-explorer:discover`** runs the read-only [Datafy discovery scanner](../../discovery-tool/aws/) across your AWS Organization.
 - **Ask questions** about the results in plain language ("which unattached gp2 volumes are over 500 GiB?").
-- **`/datafy:utilization`** measures real disk utilization on a 5% sample of your volumes: CloudWatch first, then, only with your approval, `df` over SSM.
-- **`/datafy:dashboard`** builds an offline HTML dashboard from whatever data exists, at any point.
+- **`/datafy-aws-explorer:utilization`** measures real disk utilization on a 5% sample of your volumes: CloudWatch first, then, only with your approval, `df` over SSM.
+- **`/datafy-aws-explorer:dashboard`** builds an offline HTML dashboard from whatever data exists, at any point.
 
 > **Nothing is sent to Datafy.** Everything runs on your machine with your credentials. The plugin has no
 > telemetry, no upload step, and no call home. You decide whether to share anything, and with whom.

@@ -38,7 +38,7 @@ failed with the AWS error, which you should report grouped by account.
      stock document can run arbitrary commands.
    - If instances come back `not_managed`/`ssm_offline`, explain why (no SSM agent / instance profile) and
      do not retry in a loop.
-4. Rebuild: `build_db.py`, then offer `/datafy:dashboard`.
+4. Rebuild: `build_db.py`, then offer `/datafy-aws-explorer:dashboard`.
 
 If the customer says no to either tier, record it so you do not ask again this run:
 `echo '{"cloudwatch": true}' > datafy-explorer/.declined.json` (or `"ssm"`).
