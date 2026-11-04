@@ -40,7 +40,14 @@ def log(msg):
 
 def workspace(path=None, create=True):
     """Return the workspace dir, creating it (and a local .gitignore) if needed."""
-    root = os.path.abspath(path or os.environ.get("DATAFY_WORKSPACE") or WORKSPACE_DIRNAME)
+    explicit = path or os.environ.get("DATAFY_WORKSPACE")
+    root = os.path.abspath(explicit or WORKSPACE_DIRNAME)
+    if not explicit:
+        # Already inside the workspace (e.g. a script was run from there)? Use it, don't nest a second one.
+        cwd = os.getcwd()
+        if os.path.basename(cwd) == WORKSPACE_DIRNAME and (
+                os.path.exists(os.path.join(cwd, DISCOVERY_FILE)) or os.path.exists(os.path.join(cwd, DB_FILE))):
+            root = cwd
     if create:
         os.makedirs(root, exist_ok=True)
         gi = os.path.join(root, ".gitignore")

@@ -29,7 +29,7 @@ Use `python3 ${CLAUDE_PLUGIN_ROOT}/scripts/query.py "<SQL>"` (read-only by const
 | `snapshots` | snapshot_id, account_id, region, volume_id, size_gib, start_time, state, encrypted |
 | `amis` | image_id, account_id, region, name, platform, architecture |
 | `scan_summary`, `scan_gaps` | coverage; see above |
-| `utilization_instances` | instance_id, source (`cloudwatch`/`ssm_df`), status, reason, collected_at |
+| `utilization_instances` | instance_id, source (`ssm_df` (default) or `cloudwatch`), status, reason, collected_at |
 | `utilization_mounts` | instance_id, volume_id (NULL if unmapped), mountpoint, fstype, size_bytes, used_bytes, used_pct |
 | `volume_utilization` (view) | every volume joined to its measured mount, if any |
 | `tags` | resource_type (`volume`/`instance`/`snapshot`), resource_id, account_id, region, key, value |

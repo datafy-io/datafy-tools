@@ -4,7 +4,7 @@ A Claude Code plugin that helps you explore your own AWS estate:
 
 - **`/datafy-aws-explorer:discover`** runs the read-only [Datafy discovery scanner](../../discovery-tool/aws/) across your AWS Organization.
 - **Ask anything about the results, in the session, in plain language** ("which unattached gp2 volumes are over 500 GiB?", "which accounts have no backups?"), with follow-ups. Claude writes read-only SQL against a local database, so the dashboard is optional, not the only way to see your data.
-- **`/datafy-aws-explorer:utilization`** measures real disk utilization on a 5% sample of your volumes: CloudWatch first, then, only with your approval, `df` over SSM.
+- **`/datafy-aws-explorer:utilization`** measures real disk utilization on a 5% sample of your volumes by running `df` over SSM, only with your approval. (CloudWatch metrics are an optional extra, for estates that run the CloudWatch agent.)
 - **`/datafy-aws-explorer:dashboard`** builds an offline HTML dashboard from whatever data exists, at any point.
 
 > **Nothing is sent to Datafy.** Everything runs on your machine with your credentials. The plugin has no
@@ -26,11 +26,13 @@ Needs Python 3.9+, `boto3` (`pip install boto3`), and AWS credentials for your m
 |---|---|---|
 | Discover | Scanner runs read-only across the Organization | Confirm the account; asked before `--setup-role` |
 | Sample | A representative **5%** of volumes is chosen (min 10, max 500) | Shown to you |
-| Tier 1: CloudWatch | Reads `disk_used_percent` metrics, touches no instance | Cost shown first; **hard cap $1** |
-| Tier 2: SSM `df` | Runs one fixed read-only command on the sampled instances | **Explicit yes**, with the instance list and exact command shown |
+| Document check | Looks for the read-only `DatafyDiskUsage` SSM document in each account/region (free) | Shown to you |
+| Deploy document (only if missing) | Creates that one document, tagged, and offers to delete it afterwards | **Explicit yes**, per run |
+| `df` over SSM (default) | Runs one fixed read-only command on the sampled instances | **Explicit yes**, with the instance list and exact command shown |
+| CloudWatch (optional) | Reads `disk_used_percent`; touches no instance | Cost shown first; **hard cap $1** |
 | Dashboard | Static HTML file written locally | none |
 
-You can decline either tier; the plugin asks once and remembers.
+You can decline any step; the plugin asks once and remembers.
 
 ## Exactly what it contacts
 
@@ -55,17 +57,18 @@ The plugin never spends more than **$1** of your AWS money in a run, enforced in
 | Call | Used for | Cost |
 |---|---|---|
 | EC2 `Describe*`, Organizations `List*`, STS | Scanner | Free |
-| `ssm:DescribeInstanceInformation`, `SendCommand`, `GetCommandInvocation` | Tier 2 | Free. Output returned inline, never to S3 |
-| `cloudwatch:ListMetrics` | Tier 1 | ~$0.01 per 1,000 requests |
-| `cloudwatch:GetMetricData` | Tier 1 | ~$0.01 per 1,000 metrics |
+| `ssm:DescribeInstanceInformation`, `DescribeDocument`, `SendCommand`, `GetCommandInvocation` | SSM `df` | Free. Output returned inline, never to S3 |
+| `ssm:CreateDocument`, `DeleteDocument` (+ tags) | Optional: deploy/remove `DatafyDiskUsage`, only that document | Free |
+| `cloudwatch:ListMetrics` | CloudWatch (optional) | ~$0.01 per 1,000 requests |
+| `cloudwatch:GetMetricData` | CloudWatch (optional) | ~$0.01 per 1,000 metrics |
 
 For scale: 5% of a 4,000-volume estate is ≈200 volumes, a fraction of a cent. Cost Explorer is never called.
 
-## Setting up tier 2 (SSM)
+## Setting up SSM `df`
 
 `ssm:SendCommand` can run arbitrary commands unless you restrict it. So the plugin ships a **fixed document**:
 
-1. Deploy [`iam/datafy-disk-usage.cfn.yaml`](iam/datafy-disk-usage.cfn.yaml) in each account/region you want to measure.
+1. **Easiest:** let the plugin create it, with your approval, only in the accounts/regions it needs, and delete it afterwards. Or deploy [`iam/datafy-disk-usage.cfn.yaml`](iam/datafy-disk-usage.cfn.yaml) in each account/region you want to measure.
    It creates `DatafyDiskUsage`, which runs only `df -PT -B1` and `lsblk`.
 2. Grant the identity running the plugin [`iam/ssm-sendcommand-policy.json`](iam/ssm-sendcommand-policy.json):
    `SendCommand` is allowed **on that document only**.
@@ -75,7 +78,7 @@ For scale: 5% of a 4,000-volume estate is ≈200 volumes, a fraction of a cent. 
 ### Org-wide: running from the management account
 
 The plugin runs from your **management (admin) account** and reaches every member account by assuming a role.
-For tier 1 and 2 that role must be able to read CloudWatch/SSM, and the `DatafyDiskUsage` document must exist in
+For SSM `df` (and optionally CloudWatch) that role must be able to use SSM, and the `DatafyDiskUsage` document must exist in
 each account **and region** you measure. Two options:
 
 - **Quick:** use `OrganizationAccountAccessRole` (`--role OrganizationAccountAccessRole`, the default). It is
@@ -90,7 +93,7 @@ each account **and region** you measure. Two options:
 The scanner's temporary `--setup-role` creates `DatafyDiscoveryRole`, which is read-only EC2 access and is
 **deleted after the scan**, so it cannot be reused for utilization.
 
-Tier 1 needs [`iam/cloudwatch-readonly-policy.json`](iam/cloudwatch-readonly-policy.json) and instances running the
+The optional CloudWatch method needs [`iam/cloudwatch-readonly-policy.json`](iam/cloudwatch-readonly-policy.json) and instances running the
 CloudWatch agent with `disk_used_percent`.
 
 ## Limits, stated plainly

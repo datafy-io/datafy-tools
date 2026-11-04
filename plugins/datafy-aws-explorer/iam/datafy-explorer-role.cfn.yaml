@@ -28,7 +28,7 @@ Resources:
             Statement:
               - Sid: ReadSsmInventory
                 Effect: Allow
-                Action: [ssm:DescribeInstanceInformation, ssm:ListCommandInvocations, ssm:GetCommandInvocation]
+                Action: [ssm:DescribeInstanceInformation, ssm:DescribeDocument, ssm:ListCommandInvocations, ssm:GetCommandInvocation]
                 Resource: "*"
               - Sid: RunOnlyTheDatafyDiskUsageDocument
                 Effect: Allow
@@ -36,6 +36,10 @@ Resources:
                 Resource:
                   - "arn:aws:ssm:*:*:document/DatafyDiskUsage"
                   - "arn:aws:ec2:*:*:instance/*"
+              - Sid: OptionalDeployAndRemoveTheDatafyDiskUsageDocument
+                Effect: Allow
+                Action: [ssm:CreateDocument, ssm:AddTagsToResource, ssm:ListTagsForResource, ssm:DeleteDocument]
+                Resource: "arn:aws:ssm:*:*:document/DatafyDiskUsage"
               - Sid: ReadCloudWatchAgentDiskMetrics
                 Effect: Allow
                 Action: [cloudwatch:ListMetrics, cloudwatch:GetMetricData]

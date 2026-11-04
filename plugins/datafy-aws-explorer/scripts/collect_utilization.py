@@ -11,8 +11,11 @@ Two tiers, both writing utilization.jsonl (one `instance` record per instance):
 Both default to a PLAN: they print what would happen (targets, cost, exact command) and
 change nothing. Add --yes to execute. Nothing is ever sent anywhere but your own AWS.
 
-  collect_utilization.py plan  cloudwatch|ssm   show the plan
-  collect_utilization.py run   cloudwatch|ssm --yes
+  collect_utilization.py plan       [ssm|cloudwatch]   show the plan (no AWS calls). ssm is the default.
+  collect_utilization.py check      ssm                is DatafyDiskUsage deployed where we need it? (free)
+  collect_utilization.py deploy-doc ssm --yes          create DatafyDiskUsage where missing (approval required)
+  collect_utilization.py run        [ssm|cloudwatch] --yes
+  collect_utilization.py remove-doc ssm --yes          delete the documents this tool created
 """
 import argparse
 import json
@@ -30,6 +33,12 @@ FALLBACK_DOC = "AWS-RunShellScript"
 # document's content (iam/datafy-disk-usage.cfn.yaml); the test suite asserts they match.
 REMOTE_COMMAND = ("echo '---DF---'; df -PT -B1 2>/dev/null; "
                   "echo '---LSBLK---'; lsblk -J -o NAME,SERIAL,SIZE,TYPE,MOUNTPOINT 2>/dev/null || true")
+DOC_TAG = {"Key": "created-by", "Value": "datafy-aws-explorer"}
+DOC_CONTENT = {
+    "schemaVersion": "2.2",
+    "description": "Report filesystem usage (df) and block device serials (lsblk). Read-only.",
+    "mainSteps": [{"action": "aws:runShellScript", "name": "diskUsage", "inputs": {"runCommand": [REMOTE_COMMAND]}}],
+}
 SSM_BATCH = 50          # SendCommand target limit
 CW_QUERY_BATCH = 500    # GetMetricData query limit
 PSEUDO_FS = {"tmpfs", "devtmpfs", "overlay", "squashfs", "proc", "sysfs", "cgroup", "cgroup2", "efivarfs",
@@ -180,6 +189,71 @@ def record(ws, iid, account, region, source, status, reason=None, mounts=None):
 
 # ── SSM tier ───────────────────────────────────────────────────────────────
 
+def _code(e):
+    return getattr(e, "response", {}).get("Error", {}).get("Code")
+
+
+def doc_state(ssm):
+    """'present' | 'missing' | 'error: ...' for DatafyDiskUsage in this account/region (describe is free)."""
+    try:
+        ssm.describe_document(Name=DOC_NAME)
+        return "present"
+    except Exception as e:  # noqa: BLE001
+        return "missing" if _code(e) == "InvalidDocument" else "error: %s" % _err(e)
+
+
+def scopes_for(ws, instance_ids):
+    return targets_by_scope(ws, [i for i in instance_ids if i not in already_done(ws, "ssm_df")])[0]
+
+
+def check_docs(ws, instance_ids, sessions):
+    """{'acct/region': state} for every scope the sample touches."""
+    out = {}
+    for (account, region) in scopes_for(ws, instance_ids):
+        try:
+            out["%s/%s" % (account, region)] = doc_state(sessions.client("ssm", account, region))
+        except Exception as e:  # noqa: BLE001
+            out["%s/%s" % (account, region)] = "error: %s" % _err(e)
+    return out
+
+
+def deploy_docs(ws, instance_ids, sessions):
+    """Create DatafyDiskUsage where it is missing. Tagged so remove_docs only deletes what we made."""
+    res = {}
+    for key, st in check_docs(ws, instance_ids, sessions).items():
+        account, region = key.split("/")
+        if st != "missing":
+            res[key] = "already present" if st == "present" else st
+            continue
+        try:
+            sessions.client("ssm", account, region).create_document(
+                Content=json.dumps(DOC_CONTENT), Name=DOC_NAME, DocumentType="Command",
+                DocumentFormat="JSON", Tags=[DOC_TAG])
+            res[key] = "created"
+        except Exception as e:  # noqa: BLE001
+            res[key] = "failed: %s" % _err(e)
+    return res
+
+
+def remove_docs(ws, sessions):
+    """Delete DatafyDiskUsage only where this tool created it (tag check), across scopes seen in utilization.jsonl."""
+    res = {}
+    seen = {(r["account_id"], r["region"]) for r in read_jsonl(os.path.join(ws, UTILIZATION_FILE))
+            if r.get("record_type") == "instance" and r.get("source") == "ssm_df"}
+    for account, region in sorted(seen):
+        key = "%s/%s" % (account, region)
+        try:
+            ssm = sessions.client("ssm", account, region)
+            tags = ssm.list_tags_for_resource(ResourceType="Document", ResourceId=DOC_NAME).get("TagList", [])
+            if DOC_TAG not in tags:
+                res[key] = "left alone (not created by this tool)"
+                continue
+            ssm.delete_document(Name=DOC_NAME, Force=True)
+            res[key] = "deleted"
+        except Exception as e:  # noqa: BLE001
+            res[key] = "skipped: %s" % _err(e)
+    return res
+
 def ssm_plan(ws, instance_ids, use_fallback=False):
     todo = [i for i in instance_ids if i not in already_done(ws, "ssm_df")]
     scopes, unknown = targets_by_scope(ws, todo)
@@ -229,6 +303,14 @@ def run_ssm(ws, instance_ids, sessions, use_fallback=False, poll=2.0, timeout=12
                 stats["skipped"] += 1
             else:
                 ready.append(iid)
+        if ready and not use_fallback:
+            st = doc_state(ssm)
+            if st != "present":
+                for iid in ready:
+                    record(ws, iid, account, region, "ssm_df", "skipped",
+                           "document_missing: %s is not deployed in %s/%s (%s)" % (DOC_NAME, account, region, st))
+                    stats["skipped"] += 1
+                continue
         for i in range(0, len(ready), SSM_BATCH):
             batch = ready[i:i + SSM_BATCH]
             try:
@@ -399,8 +481,8 @@ def _cw_mounts(metrics, pct_by_i, attached):
 
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    ap.add_argument("action", choices=["plan", "run"])
-    ap.add_argument("tier", choices=["cloudwatch", "ssm"])
+    ap.add_argument("action", choices=["plan", "check", "deploy-doc", "run", "remove-doc"])
+    ap.add_argument("tier", nargs="?", choices=["cloudwatch", "ssm"], default="ssm")
     ap.add_argument("--workspace")
     ap.add_argument("--profile")
     ap.add_argument("--role", default="OrganizationAccountAccessRole")
@@ -416,6 +498,20 @@ def main(argv=None):
         with open(os.path.join(ws, "sample.json")) as f:
             ids = json.load(f)["instances"]
     budget = CostBudget()
+    if a.action in ("check", "deploy-doc", "remove-doc"):
+        if a.tier != "ssm":
+            raise SystemExit("%s applies to the ssm tier only" % a.action)
+        if a.action == "check":
+            print(json.dumps(check_docs(ws, ids, Sessions(a.profile, a.role)), indent=1))
+        elif not a.yes:
+            print(json.dumps({"would": a.action, "document": DOC_NAME, "content": DOC_CONTENT,
+                              "scopes": sorted("%s/%s" % k for k in scopes_for(ws, ids))}, indent=1))
+            raise SystemExit("not approved: re-run with --yes after the customer confirms")
+        elif a.action == "deploy-doc":
+            print(json.dumps(deploy_docs(ws, ids, Sessions(a.profile, a.role)), indent=1))
+        else:
+            print(json.dumps(remove_docs(ws, Sessions(a.profile, a.role)), indent=1))
+        return
     plan = cw_plan(ws, ids, budget) if a.tier == "cloudwatch" else ssm_plan(ws, ids, a.use_aws_runshellscript)
     if a.action == "plan" or not a.yes:
         print(json.dumps(plan, indent=1))

@@ -143,9 +143,31 @@ class Budget(unittest.TestCase):
         self.assertLess(b.estimate({"ListMetrics": 500, "GetMetricData": 1000}), 0.05)
 
 
+class _ClientError(Exception):
+    def __init__(self, code):
+        super().__init__(code)
+        self.response = {"Error": {"Code": code}}
+
+
 class FakeSSM:
-    def __init__(self, managed, outputs, fail_send=False):
+    def __init__(self, managed, outputs, fail_send=False, doc_present=True, tagged=True):
         self.managed, self.outputs, self.fail_send, self.sent = managed, outputs, fail_send, []
+        self.doc_present, self.tagged, self.created, self.deleted = doc_present, tagged, [], []
+
+    def describe_document(self, Name):
+        if not self.doc_present:
+            raise _ClientError("InvalidDocument")
+        return {"Document": {"Name": Name}}
+
+    def create_document(self, **kw):
+        self.created.append(kw)
+        self.doc_present = True
+
+    def list_tags_for_resource(self, ResourceType, ResourceId):
+        return {"TagList": [cu.DOC_TAG] if self.tagged else []}
+
+    def delete_document(self, Name, Force):
+        self.deleted.append(Name)
 
     def describe_instance_information(self, Filters):
         ids = Filters[0]["Values"]
@@ -203,6 +225,56 @@ class SsmRun(unittest.TestCase):
         ssm = FakeSSM({"i-000001": ("Online", "Linux")}, {}, fail_send=True)
         stats = cu.run_ssm(ws, ["i-000001"], FakeSessions(ssm=ssm), poll=0, sleep=lambda s: None)
         self.assertEqual(stats["failed"], 1)
+
+    def test_missing_document_is_reported_per_instance_not_sent(self):
+        ws = write_ws(make_estate(40))
+        ssm = FakeSSM({"i-000001": ("Online", "Linux")}, {}, doc_present=False)
+        stats = cu.run_ssm(ws, ["i-000001"], FakeSessions(ssm=ssm), poll=0, sleep=lambda s: None)
+        self.assertEqual(stats["skipped"], 1)
+        self.assertEqual(ssm.sent, [])
+        rec = common.read_jsonl(os.path.join(ws, "utilization.jsonl"))[0]
+        self.assertTrue(rec["reason"].startswith("document_missing"))
+
+    def test_deploy_creates_only_where_missing_with_tag_and_exact_content(self):
+        ws = write_ws(make_estate(40))
+        missing, there = FakeSSM({}, {}, doc_present=False), FakeSSM({}, {}, doc_present=True)
+
+        class PerScope:
+            def client(self, svc, account, region):
+                return missing if account == "111111111111" else there
+        # i-000001 -> account 0 (111...), i-100001 -> account 1 (222...)
+        res = cu.deploy_docs(ws, ["i-000001", "i-100001"], PerScope())
+        self.assertEqual(sorted(res.values()), ["already present", "created"])
+        kw = missing.created[0]
+        self.assertEqual(kw["Name"], "DatafyDiskUsage")
+        self.assertEqual(kw["Tags"], [cu.DOC_TAG])
+        self.assertEqual(json.loads(kw["Content"])["mainSteps"][0]["inputs"]["runCommand"], [cu.REMOTE_COMMAND])
+        self.assertEqual(there.created, [])
+
+    def test_remove_only_deletes_documents_this_tool_created(self):
+        ws = write_ws(make_estate(40))
+        cu.record(ws, "i-000001", "111111111111", "us-east-1", "ssm_df", "ok", None, [])
+        cu.record(ws, "i-100001", "222222222222", "us-east-1", "ssm_df", "ok", None, [])
+        ours, theirs = FakeSSM({}, {}, tagged=True), FakeSSM({}, {}, tagged=False)
+
+        class PerScope:
+            def client(self, svc, account, region):
+                return ours if account == "111111111111" else theirs
+        res = cu.remove_docs(ws, PerScope())
+        self.assertEqual(ours.deleted, ["DatafyDiskUsage"])
+        self.assertEqual(theirs.deleted, [])
+        self.assertIn("left alone", res["222222222222/us-east-1"])
+
+    def test_document_content_matches_cloudformation(self):
+        cfn = open(os.path.join(ROOT, "iam", "datafy-disk-usage.cfn.yaml")).read()
+        self.assertIn(cu.REMOTE_COMMAND, cfn)
+        self.assertEqual(cu.DOC_CONTENT["mainSteps"][0]["inputs"]["runCommand"], [cu.REMOTE_COMMAND])
+
+    def test_ssm_is_the_default_tier(self):
+        import argparse
+        import inspect
+        src = inspect.getsource(cu.main)
+        self.assertIn('default="ssm"', src)
 
     def test_remote_command_matches_cloudformation_document(self):
         cfn = open(os.path.join(ROOT, "iam", "datafy-disk-usage.cfn.yaml")).read()
@@ -378,6 +450,25 @@ class QueryRunner(unittest.TestCase):
     def test_missing_db_is_a_clear_error(self):
         with self.assertRaises(SystemExit):
             query.connect(tempfile.mkdtemp())
+
+
+class WorkspaceNesting(unittest.TestCase):
+    def test_running_from_inside_the_workspace_does_not_nest(self):
+        base = tempfile.mkdtemp()
+        inner = os.path.join(base, "datafy-explorer")
+        os.makedirs(inner)
+        open(os.path.join(inner, "discovery.jsonl"), "w").close()
+        old, env = os.getcwd(), os.environ.pop("DATAFY_WORKSPACE", None)
+        try:
+            os.chdir(inner)
+            self.assertEqual(os.path.realpath(common.workspace()), os.path.realpath(inner))
+            self.assertFalse(os.path.exists(os.path.join(inner, "datafy-explorer")))
+            os.chdir(base)
+            self.assertEqual(os.path.realpath(common.workspace()), os.path.realpath(inner))
+        finally:
+            os.chdir(old)
+            if env is not None:
+                os.environ["DATAFY_WORKSPACE"] = env
 
 
 class Db(unittest.TestCase):

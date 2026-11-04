@@ -19,7 +19,7 @@ Run the discovery scan. Everything stays on this machine; nothing is sent to Dat
    any skipped/failed/partial scope.
 6. Then a short overview (volumes and GiB, instances, top accounts, unattached GiB, gp2 share), and end with
    the utilization offer from the `disk-utilization` skill: size alone is an estimate; measuring a 5% sample
-   would firm it up. Ask once; accept "no".
+   with `df` over SSM (read-only, free, needs their approval) would firm it up. Ask once; accept "no".
 7. Tell the customer they can now **ask anything about their estate in this session**, in plain language, and give
    five tailored examples from what you just saw, such as: "which accounts have the most unattached volumes?",
    "show unencrypted volumes in account X", "which snapshots are older than a year and have no source volume?",
