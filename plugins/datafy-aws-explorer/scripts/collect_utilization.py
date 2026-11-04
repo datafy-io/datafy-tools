@@ -11,6 +11,7 @@ Two tiers, both writing utilization.jsonl (one `instance` record per instance):
 Both default to a PLAN: they print what would happen (targets, cost, exact command) and
 change nothing. Add --yes to execute. Nothing is ever sent anywhere but your own AWS.
 
+  collect_utilization.py inventory                     which instances can SSM reach? (free, read-only; run before sampling)
   collect_utilization.py plan       [ssm|cloudwatch]   show the plan (no AWS calls). ssm is the default.
   collect_utilization.py check      ssm                is DatafyDiskUsage deployed where we need it? (free)
   collect_utilization.py deploy-doc ssm --yes          create DatafyDiskUsage where missing (approval required)
@@ -24,7 +25,7 @@ import re
 import time
 from datetime import datetime, timedelta, timezone
 
-from common import (BudgetExceeded, CostBudget, UTILIZATION_FILE, append_jsonl, log, now_iso, read_discovery,
+from common import (BudgetExceeded, CostBudget, INVENTORY_FILE, UTILIZATION_FILE, append_jsonl, log, now_iso, read_discovery,
                     read_jsonl, volume_index, workspace)
 
 DOC_NAME = "DatafyDiskUsage"
@@ -188,6 +189,49 @@ def record(ws, iid, account, region, source, status, reason=None, mounts=None):
 
 
 # ── SSM tier ───────────────────────────────────────────────────────────────
+
+def ssm_inventory(ws, sessions):
+    """Record, for every running Linux instance, whether SSM can reach it. Uses only
+    ssm:DescribeInstanceInformation (free, read-only). Overwrites ssm_inventory.jsonl: it is a fresh snapshot."""
+    running = {}
+    for r in read_discovery(ws):
+        if r.get("record_type") != "region":
+            continue
+        for i in r.get("instances", []):
+            if i.get("State") == "running" and "windows" not in (i.get("PlatformDetails") or "").lower():
+                running.setdefault((r["account_id"], r["region"]), []).append(i["InstanceId"])
+    path = os.path.join(ws, INVENTORY_FILE)
+    open(path, "w").close()
+    stats = {"scopes": len(running), "instances": sum(len(v) for v in running.values()), "reachable": 0,
+             "not_managed": 0, "offline": 0, "errors": 0}
+    for (account, region), ids in sorted(running.items()):
+        try:
+            ssm = sessions.client("ssm", account, region)
+            info = {}
+            for i in range(0, len(ids), SSM_BATCH):
+                resp = ssm.describe_instance_information(Filters=[{"Key": "InstanceIds", "Values": ids[i:i + SSM_BATCH]}])
+                for x in resp.get("InstanceInformationList", []):
+                    info[x["InstanceId"]] = x
+        except Exception as e:  # noqa: BLE001 - recorded, so an unreadable scope is not mistaken for "unreachable"
+            for iid in ids:
+                append_jsonl(path, {"record_type": "ssm", "instance_id": iid, "account_id": account, "region": region,
+                                    "managed": False, "error": _err(e), "checked_at": now_iso()})
+            stats["errors"] += len(ids)
+            continue
+        for iid in ids:
+            x = info.get(iid)
+            append_jsonl(path, {"record_type": "ssm", "instance_id": iid, "account_id": account, "region": region,
+                                "managed": bool(x), "ping_status": x.get("PingStatus") if x else None,
+                                "platform_type": x.get("PlatformType") if x else None,
+                                "agent_version": x.get("AgentVersion") if x else None, "checked_at": now_iso()})
+            if not x:
+                stats["not_managed"] += 1
+            elif x.get("PingStatus") != "Online":
+                stats["offline"] += 1
+            else:
+                stats["reachable"] += 1
+    return stats
+
 
 def _code(e):
     return getattr(e, "response", {}).get("Error", {}).get("Code")
@@ -481,7 +525,7 @@ def _cw_mounts(metrics, pct_by_i, attached):
 
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    ap.add_argument("action", choices=["plan", "check", "deploy-doc", "run", "remove-doc"])
+    ap.add_argument("action", choices=["inventory", "plan", "check", "deploy-doc", "run", "remove-doc"])
     ap.add_argument("tier", nargs="?", choices=["cloudwatch", "ssm"], default="ssm")
     ap.add_argument("--workspace")
     ap.add_argument("--profile")
@@ -492,12 +536,19 @@ def main(argv=None):
                     help="use the stock AWS-RunShellScript document if DatafyDiskUsage is not deployed")
     a = ap.parse_args(argv)
     ws = workspace(a.workspace)
-    if a.instances:
+    if a.action == "inventory":
+        ids = []
+    elif a.instances:
         ids = [x for x in a.instances.split(",") if x]
     else:
+        if not os.path.exists(os.path.join(ws, "sample.json")):
+            raise SystemExit("no sample yet: run sample_volumes.py first")
         with open(os.path.join(ws, "sample.json")) as f:
             ids = json.load(f)["instances"]
     budget = CostBudget()
+    if a.action == "inventory":
+        print(json.dumps(ssm_inventory(ws, Sessions(a.profile, a.role))))
+        return
     if a.action in ("check", "deploy-doc", "remove-doc"):
         if a.tier != "ssm":
             raise SystemExit("%s applies to the ssm tier only" % a.action)

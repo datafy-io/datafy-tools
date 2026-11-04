@@ -32,13 +32,20 @@ failed with the AWS error, which you should report grouped by account.
 
 ## Procedure (SSM)
 
-1. `python3 ${CLAUDE_PLUGIN_ROOT}/scripts/sample_volumes.py` — picks a stratified, reproducible sample (5%, min 10,
-   max 500) of volumes on running Linux instances. Tell the customer the population, the target, and how many
-   volumes are unmeasurable (unattached, stopped, Windows).
-2. `python3 ${CLAUDE_PLUGIN_ROOT}/scripts/collect_utilization.py plan` — gives you the instance list by
+1. **Find out what SSM can reach first:** `python3 ${CLAUDE_PLUGIN_ROOT}/scripts/collect_utilization.py inventory`.
+   Free and read-only (it only lists which instances have a working SSM agent; it runs nothing on them). Tell the
+   customer how many running Linux instances are reachable vs not. If most are not, say so plainly now: SSM
+   cannot measure them, and no sampling can change that.
+2. `python3 ${CLAUDE_PLUGIN_ROOT}/scripts/sample_volumes.py` — by default (`--strategy largest`) takes only
+   SSM-reachable instances and picks the ones with the **biggest data disks** first, until about 5% of the
+   reachable volumes (min 10, max 500) are covered. Tell the customer the reachable population, the target, how
+   many volumes were left out as unmeasurable (unattached, stopped, Windows) or unreachable, and that the sample
+   deliberately favours the biggest disks. Use `--strategy stratified` only if they want an estate-wide
+   statistical estimate more than the biggest disks.
+3. `python3 ${CLAUDE_PLUGIN_ROOT}/scripts/collect_utilization.py plan` — gives you the instance list by
    account/region. You use this to write the approval message (see "Asking for approval"); do not paste the plan
    JSON at the customer.
-3. `... check ssm` (free) — is `DatafyDiskUsage` deployed in each account/region? If any are `missing`, tell the
+4. `... check ssm` (free) — is `DatafyDiskUsage` deployed in each account/region? If any are `missing`, tell the
    customer plainly and offer, grouped by account:
    - **(a) Deploy it** with `deploy-doc ssm --yes`: creates only that one read-only document, tagged
      `created-by: datafy-aws-explorer`, only in the missing scopes. Needs their approval. Offer to remove it
@@ -46,10 +53,10 @@ failed with the AWS error, which you should report grouped by account.
    - **(b) Deploy it themselves** from `iam/datafy-disk-usage.cfn.yaml` (e.g. a StackSet).
    - **(c) Use the stock `AWS-RunShellScript`** (`--use-aws-runshellscript`): no deployment, but that document
      can run arbitrary commands, so only if they ask for it and understand the difference.
-4. Get an explicit yes using the approval message below, then `... run ssm --yes`. Never run any command other than the fixed one.
+5. Get an explicit yes using the approval message below, then `... run ssm --yes`. Never run any command other than the fixed one.
    Report results grouped by status and reason: `not_managed` / `ssm_offline` mean no SSM agent or instance
    profile on that instance; explain and do not retry in a loop.
-5. Rebuild: `build_db.py`, then summarize measured volumes against the 5% target, and offer
+6. Rebuild: `build_db.py`, then summarize measured volumes against the 5% target, and offer
    `/datafy-aws-explorer:dashboard`.
 
 CloudWatch (optional): `collect_utilization.py plan cloudwatch`, show the cost, `run cloudwatch --yes`.
@@ -57,13 +64,20 @@ CloudWatch (optional): `collect_utilization.py plan cloudwatch`, show the cost, 
 If the customer declines, record it so you do not ask again this run:
 `echo '{"ssm": true}' > datafy-explorer/.declined.json` (or `"cloudwatch"`).
 
+## Reading the results honestly
+
+With the default `largest` strategy the sample is the biggest data disks, **not a random sample**. The dashboard's
+range therefore covers only the size bands with enough readings, on SSM-reachable volumes. Smaller disks and
+instances SSM cannot reach are reported as unmeasured, never filled in from the average. Say this when quoting
+numbers: "on the biggest disks we could reach, usage was X to Y%", never "your estate is X% full".
+
 ## Asking for approval
 
 Write the approval request in plain language. **Never show the customer script names, flags or CLI invocations**
 (no `collect_utilization.py ...`, no `--yes`, no `--profile`). Include, in this order:
 
-1. **What and where:** "I'd like to check disk usage on N instances (a 5% sample of your volumes) across X accounts
-   and Y regions," with the instances listed by account.
+1. **What and where:** "I'd like to check disk usage on N instances (the ones SSM can reach, with the biggest data
+   disks first) across X accounts and Y regions," with the instances listed by account.
 2. **A reassurance that is accurate and complete**, for example:
    > This only runs `df` (the same report as `df -h`) and `lsblk` (which lists which disk is which). They read
    > disk sizes and usage and nothing else: nothing is installed, changed or deleted, and nothing is sent to

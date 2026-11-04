@@ -2682,7 +2682,7 @@ function uxHead(U, E) {
     h = '<h2 class="ux-headline">Between <b>' + uxPct0(lo) + '%</b> and <b>' + uxPct0(hi) +
         '%</b> of your provisioned GiB is empty</h2>' +
         '<div class="sub">About ' + uxGiB(est.range.empty_gib[0]) + ' to ' + uxGiB(est.range.empty_gib[1]) +
-        ' of ' + uxGiB(est.total_gib) + ' on volumes attached to running Linux instances. ' +
+        ' of ' + uxGiB(est.total_gib) + ' ' + escapeHtml(est.scope_label || 'on volumes attached to running Linux instances') + '. ' +
         escapeHtml(est.note || '') + '</div>';
   } else if (has) {
     h = '<h2 class="ux-headline">Not enough measurements to estimate yet</h2>' +

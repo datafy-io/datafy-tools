@@ -16,6 +16,7 @@ WORKSPACE_DIRNAME = "datafy-explorer"
 DISCOVERY_FILE = "discovery.jsonl"
 UTILIZATION_FILE = "utilization.jsonl"
 ENRICHMENT_FILE = "enrichment.jsonl"
+INVENTORY_FILE = "ssm_inventory.jsonl"
 DB_FILE = "explorer.db"
 DASHBOARD_FILE = "dashboard.html"
 DECLINED_FILE = ".declined.json"
@@ -83,6 +84,17 @@ def append_jsonl(path, rec):
 def read_discovery(ws):
     """Region records etc. from the scanner file (which is JSONL, one object per line)."""
     return read_jsonl(os.path.join(ws, DISCOVERY_FILE))
+
+
+def ssm_reachable(ws):
+    """Set of instance ids SSM can reach (online, Linux), or None if no inventory has been taken yet."""
+    import os as _os
+    path = _os.path.join(ws, INVENTORY_FILE)
+    if not _os.path.exists(path):
+        return None
+    return {r["instance_id"] for r in read_jsonl(path)
+            if r.get("record_type") == "ssm" and r.get("managed") and r.get("ping_status") == "Online"
+            and r.get("platform_type") == "Linux"}
 
 
 def volume_index(records):

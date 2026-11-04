@@ -1,10 +1,17 @@
 #!/usr/bin/env python3
-"""Pick a representative, reproducible sample of volumes to measure.
+"""Pick the volumes to measure: SSM-reachable instances, biggest data disks first.
 
-Population = volumes attached to a *running* instance. Unattached volumes and volumes on
+Strategy `largest` (default): population = volumes on running Linux instances that SSM can actually reach (from
+ssm_inventory.jsonl, taken by `collect_utilization.py inventory`). Instances are ranked by their largest *data*
+(non-root) disk, then total size, and taken from the top until the target number of volumes is covered. The sample
+is deliberately NOT random: it concentrates where utilization matters most, so extrapolation is restricted
+(see extrapolate.py). Strategy `stratified` draws a seeded random sample across account x type x size band
+and is the one to use when an estate-wide estimate matters more than finding the biggest disks.
+
+Original description (applies to both): population = volumes attached to a *running* instance. Unattached volumes and volumes on
 stopped instances have no live filesystem to read, so they cannot be measured.
 
-Size = 5% of the population, floored at 10 and capped at 500 (never more than exists).
+Target size = 5% of the population, floored at 10 and capped at 500 (never more than exists).
 Selection is stratified by account x volume type x size band, allocated proportionally
 (largest remainder) with every stratum represented while the budget allows, then drawn
 with a seeded RNG so the same input always yields the same sample.
@@ -23,7 +30,7 @@ import os
 import random
 
 from common import (SAMPLE_CEILING, SAMPLE_FLOOR, SAMPLE_FRACTION, UTILIZATION_FILE, read_discovery,
-                    read_jsonl, volume_index, workspace, log)
+                    read_jsonl, ssm_reachable, volume_index, workspace, log)
 
 SIZE_BANDS = [(50, "<=50"), (200, "51-200"), (1000, "201-1000"), (float("inf"), ">1000")]
 
@@ -71,8 +78,60 @@ def allocate(strata_sizes, n):
     return alloc
 
 
-def draw(idx, measured_ids, fraction=SAMPLE_FRACTION, count=None, seed="datafy"):
-    pop = measurable(idx)
+def restrict_to_reachable(pop, reachable):
+    if reachable is None:
+        return pop
+    return {v: e for v, e in pop.items() if e["instance"]["InstanceId"] in reachable}
+
+
+def data_disk_gib(entry_vols, root_device):
+    """Largest non-root volume, or 0 if the instance only has its root disk."""
+    return max([v.get("Size") or 0 for v in entry_vols if v.get("Device") != root_device] or [0])
+
+
+def draw_largest(idx, measured_ids, reachable=None, fraction=SAMPLE_FRACTION, count=None):
+    full = measurable(idx)
+    pop = restrict_to_reachable(full, reachable)
+    n_total = target_size(len(pop), fraction, count)
+    already = len([v for v in pop if v in measured_ids])
+    need = max(0, n_total - already)
+    by_inst = {}
+    for vid, e in pop.items():
+        by_inst.setdefault(e["instance"]["InstanceId"], []).append((vid, e))
+    ranked = []
+    for iid, items in by_inst.items():
+        todo = [vid for vid, _ in items if vid not in measured_ids]
+        if not todo:
+            continue
+        vols = [e["volume"] for _, e in items]
+        big = data_disk_gib(vols, items[0][1]["instance"].get("RootDeviceName"))
+        ranked.append((big > 0, big, sum(v.get("Size") or 0 for v in vols), iid, sorted(todo), items[0][1]["account_id"]))
+    ranked.sort(key=lambda r: (r[0], r[1], r[2], r[3]), reverse=True)
+    picked, instances, selection = [], [], []
+    for has_data, big, total, iid, todo, account in ranked:
+        if len(picked) >= need:
+            break
+        picked += todo
+        instances.append(iid)
+        selection.append({"instance_id": iid, "account_id": account, "largest_data_disk_gib": big,
+                          "total_gib": total, "volumes": len(todo)})
+    return {
+        "strategy": "largest",
+        "population": len(pop),
+        "unmeasurable": len(idx) - len(full),
+        "unreachable_by_ssm": (len(full) - len(pop)) if reachable is not None else None,
+        "ssm_inventory": "applied" if reachable is not None else "absent: run `collect_utilization.py inventory` first",
+        "target": n_total,
+        "already_measured": already,
+        "volumes": sorted(picked),
+        "instances": sorted(instances),
+        "selection": selection,
+        "strata": 0,
+    }
+
+
+def draw(idx, measured_ids, fraction=SAMPLE_FRACTION, count=None, seed="datafy", reachable=None):
+    pop = restrict_to_reachable(measurable(idx), reachable)
     n_total = target_size(len(pop), fraction, count)
     already = len([v for v in pop if v in measured_ids])
     need = max(0, n_total - already)
@@ -91,8 +150,9 @@ def draw(idx, measured_ids, fraction=SAMPLE_FRACTION, count=None, seed="datafy")
     picked.sort()
     instances = sorted({idx[v]["instance"]["InstanceId"] for v in picked})
     return {
+        "strategy": "stratified",
         "population": len(pop),
-        "unmeasurable": len(idx) - len(pop),
+        "unmeasurable": len(idx) - len(measurable(idx)),
         "target": n_total,
         "already_measured": already,
         "volumes": picked,
@@ -107,6 +167,8 @@ def main(argv=None):
     ap.add_argument("--fraction", type=float, default=SAMPLE_FRACTION)
     ap.add_argument("--count", type=int)
     ap.add_argument("--seed", default="datafy")
+    ap.add_argument("--strategy", choices=["largest", "stratified"], default="largest")
+    ap.add_argument("--ignore-ssm", action="store_true", help="do not restrict to SSM-reachable instances")
     a = ap.parse_args(argv)
     ws = workspace(a.workspace)
     idx = volume_index(read_discovery(ws))
@@ -116,12 +178,19 @@ def main(argv=None):
     for r in read_jsonl(os.path.join(ws, UTILIZATION_FILE)):
         if r.get("record_type") == "instance" and r.get("status") in ("ok", "partial"):
             measured.update(m["volume_id"] for m in r.get("mounts", []) if m.get("volume_id"))
-    plan = draw(idx, measured, a.fraction, a.count, a.seed)
-    plan["generated_with"] = {"fraction": a.fraction, "count": a.count, "seed": a.seed}
+    reachable = None if a.ignore_ssm else ssm_reachable(ws)
+    if reachable is None and not a.ignore_ssm:
+        log("warning: no SSM inventory yet, so reachability is unknown. Run `collect_utilization.py inventory` first.")
+    if a.strategy == "largest":
+        plan = draw_largest(idx, measured, reachable, a.fraction, a.count)
+    else:
+        plan = draw(idx, measured, a.fraction, a.count, a.seed, reachable)
+        plan["ssm_inventory"] = "applied" if reachable is not None else "absent"
+    plan["generated_with"] = {"fraction": a.fraction, "count": a.count, "seed": a.seed, "strategy": a.strategy}
     with open(os.path.join(ws, "sample.json"), "w") as f:
         json.dump(plan, f, indent=1)
     log("wrote %s" % os.path.join(ws, "sample.json"))
-    print(json.dumps({k: plan[k] for k in ("population", "unmeasurable", "target", "already_measured")}
+    print(json.dumps({k: plan[k] for k in ("strategy", "population", "unmeasurable", "target", "already_measured", "ssm_inventory")}
                      | {"sampled_volumes": len(plan["volumes"]), "instances": len(plan["instances"])}))
 
 

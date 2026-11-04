@@ -18,6 +18,7 @@ import os
 
 from common import (DASHBOARD_FILE, DISCOVERY_FILE, UTILIZATION_FILE, now_iso, read_discovery, read_jsonl,
                     volume_index, workspace, log)
+from common import ssm_reachable
 from extrapolate import estimate
 from sample_volumes import measurable, target_size
 
@@ -51,6 +52,14 @@ def js_json(obj):
     return s.replace("<", "\\u003c").replace(">", "\\u003e").replace("&", "\\u0026")
 
 
+def _sample_strategy(ws):
+    try:
+        with open(os.path.join(ws, "sample.json")) as f:
+            return json.load(f).get("generated_with", {}).get("strategy", "stratified")
+    except (OSError, ValueError):
+        return "stratified"
+
+
 def build_embed(ws):
     path = os.path.join(ws, DISCOVERY_FILE)
     if not os.path.exists(path):
@@ -60,7 +69,8 @@ def build_embed(ws):
     idx = volume_index(read_discovery(ws))
     util = [r for r in read_jsonl(os.path.join(ws, UTILIZATION_FILE)) if r.get("record_type") == "instance"]
     pct = measured_pct(util)
-    est = estimate(idx, pct)
+    strategy, reachable = _sample_strategy(ws), ssm_reachable(ws)
+    est = estimate(idx, pct, strategy, reachable)
     pop = measurable(idx)
     target = target_size(len(pop))
     sample_file = os.path.join(ws, "sample.json")

@@ -56,6 +56,88 @@ class Sampling(unittest.TestCase):
         self.assertEqual(alloc[("a",)], 1)
 
 
+def disks_estate(spec, account="111111111111"):
+    """spec: {instance_id: [data disk sizes]}; every instance also has an 8 GiB root disk. All running Linux."""
+    vols, insts = [], []
+    for iid, data in spec.items():
+        insts.append({"InstanceId": iid, "State": "running", "PlatformDetails": "Linux/UNIX",
+                      "RootDeviceName": "/dev/xvda", "InstanceType": "m5.large", "Tags": []})
+        vols.append({"VolumeId": "vol-%s-root" % iid, "Size": 8, "VolumeType": "gp3", "State": "in-use",
+                     "InstanceId": iid, "Device": "/dev/xvda", "Tags": []})
+        for k, g in enumerate(data):
+            vols.append({"VolumeId": "vol-%s-d%d" % (iid, k), "Size": g, "VolumeType": "gp3", "State": "in-use",
+                         "InstanceId": iid, "Device": "/dev/sd%s" % "fgh"[k], "Tags": []})
+    return [{"record_type": "region", "account_id": account, "region": "us-east-1", "status": "ok", "errors": [],
+             "volumes": vols, "instances": insts, "amis": [], "snapshots": [], "dlm_policies": [], "backup_plans": []}]
+
+
+class LargestSampling(unittest.TestCase):
+    SPEC = {"i-a": [100], "i-b": [2000], "i-c": [500, 40], "i-d": [], "i-e": [4000], "i-f": [1000]}
+
+    def idx(self):
+        return common.volume_index(disks_estate(self.SPEC))
+
+    def test_picks_biggest_data_disks_first_among_reachable_only(self):
+        reach = {"i-a", "i-b", "i-c", "i-d", "i-f"}          # i-e has the biggest disk but is NOT reachable
+        plan = sv.draw_largest(self.idx(), set(), reach, count=4)
+        order = [x["instance_id"] for x in plan["selection"]]
+        self.assertNotIn("i-e", order)
+        self.assertEqual(order[:2], ["i-b", "i-f"])           # 2000 then 1000, then 500 (i-c) ...
+        self.assertEqual(plan["unreachable_by_ssm"], 2)       # i-e's two volumes
+        self.assertEqual(plan["ssm_inventory"], "applied")
+
+    def test_root_only_instances_rank_last(self):
+        plan = sv.draw_largest(self.idx(), set(), None, count=12)   # all 12 volumes: no inventory, everything eligible
+        self.assertEqual(plan["selection"][-1]["instance_id"], "i-d")
+        self.assertEqual(plan["selection"][0]["instance_id"], "i-e")
+
+    def test_target_counts_volumes_and_stops(self):
+        plan = sv.draw_largest(self.idx(), set(), None, count=4)
+        self.assertGreaterEqual(len(plan["volumes"]), 4)
+        self.assertLessEqual(len(plan["instances"]), 3)            # 2 volumes each, so 2 instances suffice
+
+    def test_cumulative_skips_measured_instances(self):
+        first = sv.draw_largest(self.idx(), set(), None, count=2)
+        measured = set(first["volumes"])
+        second = sv.draw_largest(self.idx(), measured, None, count=4)
+        self.assertFalse(set(first["instances"]) & set(second["instances"]))
+
+    def test_missing_inventory_is_said_out_loud(self):
+        self.assertIn("absent", sv.draw_largest(self.idx(), set(), None, count=2)["ssm_inventory"])
+
+    def test_ssm_reachable_reads_inventory(self):
+        ws = write_ws(disks_estate(self.SPEC))
+        self.assertIsNone(common.ssm_reachable(ws))
+        for iid, managed, ping, plat in (("i-a", True, "Online", "Linux"), ("i-b", True, "ConnectionLost", "Linux"),
+                                         ("i-c", False, None, None), ("i-d", True, "Online", "Windows")):
+            common.append_jsonl(os.path.join(ws, "ssm_inventory.jsonl"), {
+                "record_type": "ssm", "instance_id": iid, "managed": managed, "ping_status": ping, "platform_type": plat})
+        self.assertEqual(common.ssm_reachable(ws), {"i-a"})
+
+
+class Inventory(unittest.TestCase):
+    def test_records_reachability_and_unreadable_scopes(self):
+        ws = write_ws(disks_estate({"i-a": [100], "i-b": [100], "i-c": [100]}))
+        ssm = FakeSSM({"i-a": ("Online", "Linux"), "i-b": ("ConnectionLost", "Linux")}, {})
+        stats = cu.ssm_inventory(ws, FakeSessions(ssm=ssm))
+        self.assertEqual((stats["reachable"], stats["offline"], stats["not_managed"]), (1, 1, 1))
+        self.assertEqual(common.ssm_reachable(ws), {"i-a"})
+
+        class Denied:
+            def describe_instance_information(self, Filters):
+                raise _ClientError("AccessDeniedException")
+        stats = cu.ssm_inventory(ws, FakeSessions(ssm=Denied()))
+        self.assertEqual(stats["errors"], 3)
+        recs = common.read_jsonl(os.path.join(ws, "ssm_inventory.jsonl"))
+        self.assertTrue(all("error" in r and not r["managed"] for r in recs))
+
+    def test_inventory_never_sends_a_command(self):
+        ws = write_ws(disks_estate({"i-a": [100]}))
+        ssm = FakeSSM({"i-a": ("Online", "Linux")}, {})
+        cu.ssm_inventory(ws, FakeSessions(ssm=ssm))
+        self.assertEqual(ssm.sent, [])
+
+
 class Extrapolation(unittest.TestCase):
     def test_no_range_when_sample_tiny(self):
         idx = common.volume_index(make_estate(200))
@@ -88,6 +170,39 @@ LSBLK = json.dumps({"blockdevices": [
     {"name": "nvme3n1", "serial": "vol0dddddddddddddddd", "type": "disk", "children": [
         {"name": "vg-lv", "serial": None, "type": "lvm", "mountpoint": "/lvm"}]},
 ]})
+
+
+class LargestExtrapolation(unittest.TestCase):
+    def test_does_not_extrapolate_to_unmeasured_size_bands_or_unreachable(self):
+        # 6 big volumes (all measured) and 40 small ones (none measured), plus 4 big on an unreachable instance
+        spec = {"i-big%d" % i: [2000] for i in range(6)}
+        spec.update({"i-small%d" % i: [20] for i in range(40)})
+        spec.update({"i-gone%d" % i: [2000] for i in range(4)})
+        idx = common.volume_index(disks_estate(spec))
+        reach = {i for i in spec if not i.startswith("i-gone")}
+        meas = {"vol-i-big%d-d0" % i: 30.0 + i for i in range(6)}
+        out = extrapolate.estimate(idx, meas, "largest", reach)
+        self.assertEqual(out["scope_label"], "on SSM-reachable volumes in the size bands that were measured")
+        self.assertEqual(out["total_gib"], 12000)             # only the measured band, reachable only
+        self.assertGreater(out["unmeasured_gib"], 0)
+        self.assertGreater(out["eligible_gib"], out["total_gib"])
+        lo, hi = out["range"]["used_pct"]
+        self.assertTrue(28 <= lo <= hi <= 40, out["range"])    # reflects the big disks, not diluted by the small ones
+        self.assertIn("not a statistical sample", out["note"])
+
+    def test_stratified_strategy_is_unchanged(self):
+        idx = common.volume_index(make_estate(400))
+        pop = sorted(sv.measurable(idx))
+        meas = {v: 20.0 + (i % 5) for i, v in enumerate(pop[::4])}
+        self.assertEqual(extrapolate.estimate(idx, meas)["range"],
+                         extrapolate.estimate(idx, meas, "stratified")["range"])
+
+    def test_no_covered_band_gives_no_range(self):
+        sizes = [30, 100, 150, 500, 600, 2000]                    # bands: <=50 (1), 51-200 (2), 201-1000 (2), >1000 (1)
+        idx = common.volume_index(disks_estate({"i-a%d" % i: [g] for i, g in enumerate(sizes)}))
+        meas = {"vol-i-a%d-d0" % i: 50.0 for i in range(6)}       # no band has the 3 readings needed
+        out = extrapolate.estimate(idx, meas, "largest", None)
+        self.assertIsNone(out["range"])
 
 
 class Parsing(unittest.TestCase):

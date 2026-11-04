@@ -25,7 +25,8 @@ Needs Python 3.9+, `boto3` (`pip install boto3`), and AWS credentials for your m
 | Step | What happens | Your approval |
 |---|---|---|
 | Discover | Scanner runs read-only across the Organization | Confirm the account; asked before `--setup-role` |
-| Sample | A representative **5%** of volumes is chosen (min 10, max 500) | Shown to you |
+| SSM inventory | Lists which running Linux instances SSM can reach. Free, read-only, runs nothing on them | none |
+| Sample | Among reachable instances, the ones with the **biggest data disks** first, about 5% of volumes (min 10, max 500) | Shown to you |
 | Document check | Looks for the read-only `DatafyDiskUsage` SSM document in each account/region (free) | Shown to you |
 | Deploy document (only if missing) | Creates that one document, tagged, and offers to delete it afterwards | **Explicit yes**, per run |
 | `df` over SSM (default) | Runs one fixed read-only command on the sampled instances | **Explicit yes**, with the instance list and a plain-language explanation. Only `df` and `lsblk` run, and the exact command is shown on request |
@@ -98,6 +99,7 @@ CloudWatch agent with `disk_used_percent`.
 
 ## Limits, stated plainly
 
+- **The sample is the biggest disks, not a random one.** So the range covers only the size bands with enough readings, on SSM-reachable volumes; smaller disks and unreachable instances are reported as unmeasured, never filled in from an average. (`--strategy stratified` gives a random, estate-wide sample instead.)
 - **Measured vs estimated.** Without utilization data the dashboard estimates from provisioned size. With it,
   results are a *range* extrapolated from the sample, never a point value, and with fewer than 5 volumes measured
   no estimate is given.
