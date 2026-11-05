@@ -1,0 +1,40 @@
+name: Desktop app
+
+on:
+  push:
+    branches: [master]
+    paths: ["desktop-app/**", ".github/workflows/desktop-app.yml"]
+  pull_request:
+    paths: ["desktop-app/**", ".github/workflows/desktop-app.yml"]
+
+jobs:
+  test:
+    name: Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    defaults:
+      run:
+        working-directory: desktop-app
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: desktop-app/go.mod
+          cache-dependency-path: desktop-app/go.sum
+      - name: Format
+        run: test -z "$(gofmt -l .)"
+      - name: Vet
+        run: go vet ./...
+      - name: Tests (race detector on)
+        run: go test -race -count=1 ./...
+      - name: Dev build tags
+        run: go test -tags dev -count=1 ./internal/config/ ./internal/protocol/
+      - name: Cross-compile every target
+        shell: bash
+        run: |
+          for t in windows/amd64 windows/arm64 linux/amd64 linux/arm64 darwin/amd64 darwin/arm64; do
+            GOOS=${t%/*} GOARCH=${t#*/} go build -o /dev/null ./cmd/datafy-discovery
+          done

@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Datafy Discovery
+Comment=Reads your AWS estate for the Datafy page
+# The link is passed as ONE argument (%u); the program validates it and refuses anything it does not trust.
+Exec=datafy-discovery %u
+NoDisplay=true
+MimeType=x-scheme-handler/datafy-discovery;
