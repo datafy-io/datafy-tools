@@ -19,13 +19,20 @@ Usage:
 
   # Skip specific accounts
   python3 discovery.py --exclude 333333333333
+
+  # Keep tag values and account IDs out of the output (see the README)
+  python3 discovery.py --anonymize-tags --anonymize-accounts
 """
 
 import argparse
+import hashlib
 import json
 import os
+import re
+import secrets
 import signal
 import sys
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
@@ -143,6 +150,232 @@ DISCOVERY_ROLE_TEMPLATE = json.dumps({
         }
     },
 })
+
+
+# ── Anonymization (--anonymize-tags, --anonymize-accounts) ─────────────────────
+# SAAS-252. Some customers do not want to share their tag values or account IDs
+# with Datafy. Everything here runs on the customer's machine, before a record
+# is written, so the file that leaves the building never holds the real values.
+#
+# The rules are identical in the bash and Go implementations, and the parity
+# harness holds all three to the same output byte for byte — change one, change
+# all three.
+
+KEY_FILE_ENV    = "DATAFY_ANONYMIZE_KEY_FILE"
+KEY_MIN_CHARS   = 32
+MAPPING_SUFFIX  = ".mapping.private"
+NAME_HASH_CHARS = 16     # 64 bits: names are few, and a collision would merge two clusters
+ACCT_HASH_CHARS = 12
+
+KIND_ACCOUNT, KIND_CLUSTER, KIND_NODE_GROUP, KIND_ASG = "account", "cluster", "node_group", "asg"
+
+# A twelve-digit run bounded by non-word characters. ASCII \b, to agree with the
+# Go implementation about what a boundary is.
+ACCOUNT_ID_PATTERN = re.compile(r"\b[0-9]{12}\b", re.ASCII)
+
+# Tag keys that map to an output field. Where there is more than one, the first
+# key present wins.
+CLUSTER_KEYS    = ("eks:cluster-name", "aws:eks:cluster-name", "eks:eks-cluster-name",
+                   "ClusterName", "KubernetesCluster")
+K8S_CLUSTER_PREFIX = "kubernetes.io/cluster/"     # the cluster name is in the key
+CSI_CLUSTER_KEY = "ebs.csi.aws.com/cluster-name"
+NODE_GROUP_KEYS = ("eks:nodegroup-name", "karpenter.sh/nodepool")
+ASG_KEY         = "aws:autoscaling:groupName"
+# Present on Kubernetes volumes, but carry nothing worth keeping.
+K8S_MARKER_KEYS = ("ebs.csi.aws.com/cluster", "CSIVolumeName", "kubernetes.io/created-for/pv/name")
+
+DATAFY_TAG_KEY, DATAFY_TAG_VALUE, DATAFY_TAG_PREFIX = "Managed-By", "Datafy.io", "datafy:"
+
+
+def key_file_path():
+    return os.environ.get(KEY_FILE_ENV) or os.path.join(
+        os.path.expanduser("~"), ".datafy-discovery", "anonymize.key")
+
+
+def load_or_create_key():
+    """The secret that keys every hash. Generated on first use and kept, so the
+    same name hashes the same way on later runs."""
+    path = key_file_path()
+    try:
+        with open(path) as f:
+            key = f.read().strip()
+        if len(key) < KEY_MIN_CHARS:
+            raise AnonymizationError(
+                f"the anonymization key in {path} is too short — delete the file to generate a new one")
+        return key
+    except FileNotFoundError:
+        pass
+    except OSError as e:
+        raise AnonymizationError(f"cannot read the anonymization key {path}: {e.strerror}")
+
+    key = secrets.token_hex(32)
+    try:
+        os.makedirs(os.path.dirname(path) or ".", mode=0o700, exist_ok=True)
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError:                       # another run created it first — use theirs
+        return load_or_create_key()
+    except OSError as e:
+        raise AnonymizationError(
+            f"cannot write the anonymization key {path} (set {KEY_FILE_ENV} to use another location): {e.strerror}")
+    with os.fdopen(fd, "w") as f:
+        f.write(key + "\n")
+    return key
+
+
+class AnonymizationError(Exception):
+    pass
+
+
+class Anonymizer:
+    def __init__(self, tags, accounts):
+        self.tags, self.accounts = tags, accounts
+        self.key = load_or_create_key()
+        self._lock = threading.Lock()
+        self.mapping = {}                         # kind -> {alias: real value}
+
+    def info(self):
+        return {"tags": self.tags, "accounts": self.accounts}
+
+    def alias(self, kind, real):
+        """The stable stand-in for a real value, remembered for the mapping file.
+
+        SHA-256 over "<key>\n<kind>\n<value>": the key is a 256-bit secret, so
+        without it a name cannot be recovered by hashing guesses, and the kind
+        keeps a cluster and an ASG of the same name from colliding. Go and bash
+        compute exactly the same thing.
+        """
+        digest = hashlib.sha256(f"{self.key}\n{kind}\n{real}".encode()).hexdigest()
+        out = f"acct-{digest[:ACCT_HASH_CHARS]}" if kind == KIND_ACCOUNT else digest[:NAME_HASH_CHARS]
+        with self._lock:
+            self.mapping.setdefault(kind, {})[out] = real
+        return out
+
+    def scrub_accounts(self, line):
+        """Replace every account ID in an encoded record with its alias.
+
+        Works on the encoded text so nothing is missed: account_id fields, an
+        instance's OwnerId, and the account IDs AWS embeds in error messages and
+        ARNs are all just twelve digits. A twelve-digit run that is not an
+        account is aliased too — over-masking is the safe direction, and the
+        mapping file has it.
+        """
+        return ACCOUNT_ID_PATTERN.sub(lambda m: self.alias(KIND_ACCOUNT, m.group(0)), line)
+
+    def mapping_document(self, created_at):
+        doc = {
+            "note": "PRIVATE: maps the anonymized values in the discovery output back to the real ones. "
+                    "Keep this file; do not send it to Datafy.",
+            "tool_version": VERSION,
+            "created_at":   created_at,
+        }
+        sections = []
+        if self.accounts:
+            sections.append(("accounts", KIND_ACCOUNT))
+        if self.tags:
+            sections += [("clusters", KIND_CLUSTER), ("node_groups", KIND_NODE_GROUP), ("asgs", KIND_ASG)]
+        for name, kind in sections:
+            doc[name] = dict(sorted(self.mapping.get(kind, {}).items()))
+        return json.dumps(doc, indent=2, sort_keys=True, ensure_ascii=False) + "\n"
+
+    # -- tags ------------------------------------------------------------------
+
+    @staticmethod
+    def facts(tags):
+        """What a resource's tags say, as plain values: cluster, node_group, asg
+        (real names, "" when absent), is_k8s and managed_by."""
+        vals = {t["Key"]: t["Value"] for t in tags}
+        has = vals.__contains__
+
+        def has_prefix(p):
+            return any(k.startswith(p) for k in vals)
+
+        f = {"cluster": "", "node_group": "", "asg": vals.get(ASG_KEY, ""),
+             "is_k8s": False, "managed_by": ""}
+
+        for k in CLUSTER_KEYS:
+            if has(k):
+                f["is_k8s"] = True
+                f["cluster"] = f["cluster"] or vals[k]
+        # kubernetes.io/cluster/<name>: smallest key first, so a volume tagged
+        # for two clusters resolves the same way every run.
+        named = sorted(k for k in vals if k.startswith(K8S_CLUSTER_PREFIX) and len(k) > len(K8S_CLUSTER_PREFIX))
+        if named:
+            f["is_k8s"] = True
+            f["cluster"] = f["cluster"] or named[0][len(K8S_CLUSTER_PREFIX):]
+        if has(CSI_CLUSTER_KEY):
+            f["is_k8s"] = True
+            f["cluster"] = f["cluster"] or vals[CSI_CLUSTER_KEY]
+
+        for k in NODE_GROUP_KEYS:
+            if has(k):
+                f["is_k8s"] = True
+                f["node_group"] = f["node_group"] or vals[k]
+        if any(has(k) for k in K8S_MARKER_KEYS):
+            f["is_k8s"] = True
+
+        # First match in this order; the tag's value is never kept.
+        if has("eks:nodegroup-name"):
+            f["managed_by"] = "eks-nodegroup"
+        elif has(ASG_KEY):
+            f["managed_by"] = "autoscaling-group"
+        elif has_prefix("karpenter.sh/"):
+            f["managed_by"] = "karpenter"
+        elif has("cast:managed-by") or has_prefix("autoscaling.cast.ai/"):
+            f["managed_by"] = "cast.ai"
+        elif has("kops.k8s.io/instancegroup"):
+            f["managed_by"] = "kops"
+        elif has_prefix("sigs.k8s.io/cluster-api-provider-aws/"):
+            f["managed_by"] = "cluster-api"
+        elif has("aws:cloudformation:stack-name"):
+            f["managed_by"] = "cloudformation"
+        return f
+
+    def fields(self, f):
+        def opt(kind, v):
+            return self.alias(kind, v) if v else None
+        return {
+            "cluster":    opt(KIND_CLUSTER, f["cluster"]),
+            "node_group": opt(KIND_NODE_GROUP, f["node_group"]),
+            "asg":        opt(KIND_ASG, f["asg"]),
+            "is_k8s":     bool(f["is_k8s"] or f["cluster"] or f["node_group"]),
+            "managed_by": f["managed_by"] or None,
+        }
+
+    @staticmethod
+    def datafy_tags(tags):
+        """Datafy's own tags, and nothing else."""
+        return [t for t in tags
+                if (t["Key"] == DATAFY_TAG_KEY and t["Value"] == DATAFY_TAG_VALUE)
+                or t["Key"].startswith(DATAFY_TAG_PREFIX)]
+
+    def anonymize_tags(self, volumes, instances, snapshots):
+        """Replace every tag on volumes, instances and snapshots with the handful
+        of derived fields, and clear Name. A volume inherits cluster, node group
+        and ASG from the instance it is attached to; its own tags override."""
+        by_instance = {}
+        for inst in instances:
+            f = self.facts(inst["Tags"])
+            by_instance[inst["InstanceId"]] = f
+            inst.update(self.fields(f))
+            inst["Tags"] = self.datafy_tags(inst["Tags"])
+            inst["Name"] = None
+        for vol in volumes:
+            f = self.facts(vol["Tags"])
+            parent = by_instance.get(vol["InstanceId"])
+            if parent:
+                for k in ("cluster", "node_group", "asg"):
+                    f[k] = f[k] or parent[k]
+            vol.update(self.fields(f))
+            vol["Tags"] = self.datafy_tags(vol["Tags"])
+            vol["Name"] = None
+        for snap in snapshots:
+            snap.update(self.fields(self.facts(snap["Tags"])))
+            snap["Tags"] = self.datafy_tags(snap["Tags"])
+
+
+# Set by main() when either flag is used; None otherwise, so a plain run takes
+# none of these paths.
+ANON = None
 
 
 # ── Utilities ──────────────────────────────────────────────────────────────────
@@ -358,6 +591,9 @@ def scan_region(session, account_id, region):
         "BackupPlanName": b["BackupPlanName"],
         "CreationDate":   iso_z(b["CreationDate"]),
     } for b in raw_plans]
+
+    if ANON is not None and ANON.tags:
+        ANON.anonymize_tags(volumes, instances, snapshots)
 
     if stats["failures"] == 0:
         status = "ok"
@@ -598,6 +834,16 @@ def main():
     parser.add_argument("--exclude", metavar="ID1,ID2,...", help="Comma-separated account IDs to skip")
     parser.add_argument("--output",  metavar="FILE",        help="Output file path (default: discovery_<timestamp>.jsonl)")
     parser.add_argument("--profile", metavar="PROFILE",     help="AWS profile to use (from ~/.aws/config)")
+    parser.add_argument(
+        "--anonymize-tags", action="store_true",
+        help="Drop every tag except Datafy's own; keep only hashed cluster/node group/ASG names "
+             "plus is_k8s and managed_by. Writes a private mapping file next to the output.",
+    )
+    parser.add_argument(
+        "--anonymize-accounts", action="store_true",
+        help="Replace account IDs with stable aliases everywhere in the output. "
+             "Writes a private mapping file next to the output.",
+    )
     args = parser.parse_args()
 
     # Reviewing the template is the whole point of this flag, so it goes to
@@ -623,6 +869,16 @@ def main():
         raise KeyboardInterrupt()
 
     signal.signal(signal.SIGTERM, _on_sigterm)
+
+    # Resolved before anything is scanned: a key that cannot be read or created
+    # is worth failing on now, not after an hour of API calls.
+    global ANON
+    if args.anonymize_tags or args.anonymize_accounts:
+        try:
+            ANON = Anonymizer(args.anonymize_tags, args.anonymize_accounts)
+        except AnonymizationError as e:
+            print(f"Error: {e}", file=sys.stderr)
+            sys.exit(1)
 
     boto3.setup_default_session(profile_name=args.profile or None)
 
@@ -681,6 +937,25 @@ def main():
                   "Check the directory exists and is writable.", file=sys.stderr)
             sys.exit(1)
 
+        # The mapping file stays with the customer. Created up front, empty and
+        # owner-only, so an unwritable location fails now rather than at the end.
+        mapping_file = output_file + MAPPING_SUFFIX
+        if ANON is not None:
+            try:
+                fd = os.open(mapping_file, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+                os.close(fd)
+            except OSError as e:
+                out_file.close()
+                print(f"Error: cannot create mapping file '{mapping_file}' — {e.strerror}.",
+                      file=sys.stderr)
+                sys.exit(1)
+
+        def emit(out, record):
+            line = json.dumps(record)
+            if ANON is not None and ANON.accounts:
+                line = ANON.scrub_accounts(line)
+            out.write(line + "\n")
+
         with out_file as out:
             # Records are written as each account completes, so an interrupted
             # run keeps everything already collected — a large org can easily be
@@ -701,7 +976,7 @@ def main():
                             records = [account_record(acct, "failed", reason)]
 
                         for record in records:
-                            out.write(json.dumps(record) + "\n")
+                            emit(out, record)
                             if record["record_type"] == "account":
                                 tally[f"accounts_{record['status']}"] += 1
                             elif record["status"] == "ok":
@@ -721,8 +996,8 @@ def main():
             # Accounts that never reported are still named, so the gap is visible.
             if interrupted and done < len(accounts):
                 for acct in accounts[done:]:
-                    out.write(json.dumps(account_record(
-                        acct, "failed", "run interrupted before this account finished")) + "\n")
+                    emit(out, account_record(
+                        acct, "failed", "run interrupted before this account finished"))
                     tally["accounts_failed"] += 1
 
             # Last line of the file, so a truncated upload is obvious and coverage
@@ -740,7 +1015,16 @@ def main():
                 "regions_partial":  tally["regions_partial"],
                 "regions_failed":   tally["regions_failed"],
             }
-            out.write(json.dumps(summary) + "\n")
+            if ANON is not None:
+                summary["anonymization"] = ANON.info()
+            emit(out, summary)
+
+        if ANON is not None:
+            try:
+                with open(mapping_file, "w") as mf:
+                    mf.write(ANON.mapping_document(summary["scanned_at"]))
+            except OSError as e:
+                log(f"Warning: could not write the mapping file {mapping_file}: {e.strerror}")
 
         if interrupted:
             log("\nRun was interrupted — the results below are partial.")
@@ -749,6 +1033,10 @@ def main():
         log(f"Regions:  {summary['regions_scanned']} scanned, {summary['regions_partial']} partial, "
             f"{summary['regions_failed']} failed")
         log(f"Output:   {output_file}")
+        if ANON is not None:
+            log(f"Mapping:  {mapping_file}")
+            log("          Maps the anonymized values back to the real ones. "
+                "Keep it — do NOT send it to Datafy.")
         if any(summary[k] for k in ("accounts_skipped", "accounts_failed",
                                     "regions_partial", "regions_failed")):
             log("\nSome accounts or regions were not fully scanned. Every one is recorded in")

@@ -58,7 +58,11 @@ go build -o discovery .
 -include    Comma-separated list of account IDs to scan
 -exclude    Comma-separated list of account IDs to skip
 -output     Output file path (default: discovery_YYYYMMDD_HHMMSS.json)
+-anonymize-tags      Drop every tag except Datafy's own; keep only hashed cluster/node group/ASG names
+-anonymize-accounts  Replace account IDs with stable aliases everywhere in the output
 ```
+
+The two anonymization flags are described in the [main README](../README.md#anonymizing-the-output), including what each one costs you.
 
 ## Performance
 

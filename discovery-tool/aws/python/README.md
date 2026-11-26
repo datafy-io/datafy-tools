@@ -52,3 +52,7 @@ python3 discovery.py --profile myprofile --role MyReadOnlyRole
 | `--include IDS` | Scan only these account IDs (comma-separated) |
 | `--exclude IDS` | Skip these account IDs (comma-separated) |
 | `--output FILE` | Output file path (default: `discovery_<timestamp>.json`) |
+| `--anonymize-tags` | Drop every tag except Datafy's own; keep only hashed cluster/node group/ASG names |
+| `--anonymize-accounts` | Replace account IDs with stable aliases everywhere in the output |
+
+The two anonymization flags are described in the [main README](../README.md#anonymizing-the-output), including what each one costs you.
