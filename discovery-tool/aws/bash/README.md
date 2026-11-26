@@ -54,7 +54,13 @@ chmod +x discovery.sh
 --include    IDS    Comma-separated account IDs to scan
 --exclude    IDS    Comma-separated account IDs to skip
 --output     FILE   Output file (default: discovery_<timestamp>.json)
+--anonymize-tags    Drop every tag except Datafy's own; keep only hashed cluster/node
+                    group/ASG names plus is_k8s and managed_by
+--anonymize-accounts
+                    Replace account IDs with stable aliases everywhere in the output
 ```
+
+The two anonymization flags are described in the [main README](../README.md#anonymizing-the-output), including what each one costs you. They additionally need `sha256sum`, `shasum` or `openssl` to hash names (one of them is on every Linux and macOS install).
 
 ## Tests
 

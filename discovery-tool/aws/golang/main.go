@@ -12,9 +12,12 @@
 //	  -include    Comma-separated account IDs to scan
 //	  -exclude    Comma-separated account IDs to skip
 //	  -output     Output file (default: discovery_<timestamp>.json)
+//	  -anonymize-tags      Drop tag values; keep only hashed cluster/node group/ASG names
+//	  -anonymize-accounts  Replace account IDs with stable aliases
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"flag"
@@ -146,6 +149,7 @@ type Volume struct {
 	InstanceId       *string `json:"InstanceId"`
 	Device           *string `json:"Device"`
 	Tags             []Tag   `json:"Tags"`
+	*AnonFields
 }
 
 type Instance struct {
@@ -161,6 +165,7 @@ type Instance struct {
 	Architecture     string  `json:"Architecture"`
 	OwnerId          string  `json:"OwnerId"`
 	Tags             []Tag   `json:"Tags"`
+	*AnonFields
 }
 
 type AMI struct {
@@ -179,6 +184,7 @@ type Snapshot struct {
 	State      string  `json:"State"`
 	Encrypted  bool    `json:"Encrypted"`
 	Tags       []Tag   `json:"Tags"`
+	*AnonFields
 }
 
 type DLMPolicy struct {
@@ -240,6 +246,8 @@ type SummaryRecord struct {
 	RegionsScanned  int    `json:"regions_scanned"`
 	RegionsPartial  int    `json:"regions_partial"`
 	RegionsFailed   int    `json:"regions_failed"`
+	// Present only when an anonymization flag was used.
+	Anonymization *AnonymizationInfo `json:"anonymization,omitempty"`
 }
 
 func newAccountRecord(accountId, status, reason string) AccountRecord {
@@ -369,7 +377,7 @@ func configForAccount(ctx context.Context, base aws.Config, accountId, callerAcc
 // scanRegion always returns a record. Each AWS call is attempted independently
 // and its failure recorded, so a region that was denied is reported as such
 // instead of silently disappearing from the output. (DT-11095)
-func scanRegion(ctx context.Context, cfg aws.Config, accountId, region string) RegionRecord {
+func scanRegion(ctx context.Context, cfg aws.Config, anon *anonymizer, accountId, region string) RegionRecord {
 	ec2Client := ec2.NewFromConfig(cfg, func(o *ec2.Options) { o.Region = region })
 
 	var errs []string
@@ -552,6 +560,10 @@ func scanRegion(ctx context.Context, cfg aws.Config, accountId, region string) R
 		}
 	}
 
+	if anon != nil && anon.tags {
+		anon.anonymizeTags(volumes, instances, snapshots)
+	}
+
 	status := "ok"
 	if failures > 0 {
 		if failures >= calls {
@@ -582,7 +594,7 @@ func scanRegion(ctx context.Context, cfg aws.Config, accountId, region string) R
 // scanAccount returns the region records for an account, or a single
 // AccountRecord explaining why it could not be scanned. Exactly one of the two
 // is non-empty — an unreachable account is never dropped from the output.
-func scanAccount(ctx context.Context, base aws.Config, accountId, callerAccountId, roleName string) ([]RegionRecord, *AccountRecord) {
+func scanAccount(ctx context.Context, base aws.Config, anon *anonymizer, accountId, callerAccountId, roleName string) ([]RegionRecord, *AccountRecord) {
 	cfg, err := configForAccount(ctx, base, accountId, callerAccountId, roleName)
 	if err != nil {
 		reason := fmt.Sprintf("cannot assume role %s: %s", roleName, condense(err))
@@ -620,7 +632,7 @@ func scanAccount(ctx context.Context, base aws.Config, accountId, callerAccountI
 			defer wg.Done()
 			sem.acquire()
 			defer sem.release()
-			rec := scanRegion(ctx, cfg, accountId, region)
+			rec := scanRegion(ctx, cfg, anon, accountId, region)
 			mu.Lock()
 			records = append(records, rec)
 			mu.Unlock()
@@ -846,6 +858,10 @@ func main() {
 	includeFlag := flag.String("include", "", "Comma-separated account IDs to scan")
 	excludeFlag := flag.String("exclude", "", "Comma-separated account IDs to skip")
 	outputFlag := flag.String("output", "", "Output file (default: discovery_<timestamp>.json)")
+	anonTagsFlag := flag.Bool("anonymize-tags", false,
+		"Drop every tag except Datafy's own; keep only hashed cluster/node group/ASG names plus is_k8s and managed_by")
+	anonAccountsFlag := flag.Bool("anonymize-accounts", false,
+		"Replace account IDs with stable aliases everywhere in the output")
 	flag.Parse()
 
 	if *versionFlag {
@@ -884,6 +900,14 @@ func main() {
 		for _, a := range strings.Split(*excludeFlag, ",") {
 			exclude[strings.TrimSpace(a)] = true
 		}
+	}
+
+	// Resolved before anything is scanned: a key that cannot be read or created
+	// is worth failing on now, not after an hour of API calls.
+	anon, _, err := newAnonymizer(*anonTagsFlag, *anonAccountsFlag)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		os.Exit(1)
 	}
 
 	ctx, cancelScan := context.WithCancel(context.Background())
@@ -955,7 +979,30 @@ func main() {
 	}
 	defer f.Close()
 
-	enc := json.NewEncoder(f)
+	// The mapping file stays with the customer. It is created up front, empty and
+	// owner-only, so an unwritable location fails now rather than at the end.
+	mappingFile := ""
+	if anon.enabled() {
+		mappingFile = outputFile + mappingSuffix
+		if err := os.WriteFile(mappingFile, nil, 0o600); err != nil {
+			fmt.Fprintf(os.Stderr, "Cannot create mapping file: %v\n", err)
+			os.Exit(1)
+		}
+	}
+
+	// emit writes one record as one line. With --anonymize-accounts the encoded
+	// line is scrubbed of account IDs on the way out.
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	emit := func(v any) {
+		buf.Reset()
+		_ = enc.Encode(v)
+		line := buf.Bytes()
+		if anon != nil && anon.accounts {
+			line = anon.scrubAccounts(line)
+		}
+		_, _ = f.Write(line)
+	}
 	var (
 		mu              sync.Mutex
 		wg              sync.WaitGroup
@@ -975,14 +1022,14 @@ func main() {
 			sem.acquire()
 			defer sem.release()
 
-			records, acctRec := scanAccount(ctx, baseCfg, acct, callerAccountId, roleName)
+			records, acctRec := scanAccount(ctx, baseCfg, anon, acct, callerAccountId, roleName)
 
 			mu.Lock()
 			defer mu.Unlock()
 			done++
 
 			if acctRec != nil {
-				_ = enc.Encode(acctRec)
+				emit(acctRec)
 				if acctRec.Status == "skipped" {
 					accountsSkipped++
 				} else {
@@ -992,7 +1039,7 @@ func main() {
 			}
 
 			for _, r := range records {
-				_ = enc.Encode(r)
+				emit(r)
 				switch r.Status {
 				case "ok":
 					regionsScanned++
@@ -1019,14 +1066,25 @@ func main() {
 		RegionsScanned:  regionsScanned,
 		RegionsPartial:  regionsPartial,
 		RegionsFailed:   regionsFailed,
+		Anonymization:   anon.info(),
 	}
-	_ = enc.Encode(summary)
+	emit(summary)
+
+	if anon.enabled() {
+		if err := os.WriteFile(mappingFile, anon.mappingJSON(version, summary.ScannedAt), 0o600); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: could not write the mapping file %s: %v\n", mappingFile, err)
+		}
+	}
 
 	logf("\nAccounts: %d total, %d scanned, %d skipped, %d failed\n",
 		summary.AccountsTotal, summary.AccountsScanned, summary.AccountsSkipped, summary.AccountsFailed)
 	logf("Regions:  %d scanned, %d partial, %d failed\n",
 		summary.RegionsScanned, summary.RegionsPartial, summary.RegionsFailed)
 	logf("Output:   %s\n", outputFile)
+	if anon.enabled() {
+		logf("Mapping:  %s\n", mappingFile)
+		logf("          Maps the anonymized values back to the real ones. Keep it — do NOT send it to Datafy.\n")
+	}
 	if summary.Interrupted {
 		logf("\nRun was interrupted — the results above are partial.\n")
 		_ = f.Close()

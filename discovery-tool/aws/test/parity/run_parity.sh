@@ -52,7 +52,18 @@ cat > "$WORK/scenario.json" <<'JSON'
   "snapshots": 2,
   "ami_count": 2,
   "deny_assume": ["222222222222"],
-  "deny": { "111111111111/eu-west-1": ["DescribeVolumes"] }
+  "deny": { "111111111111/eu-west-1": ["DescribeVolumes"] },
+  "tags": {
+    "instances": [
+      { "aws:autoscaling:groupName": "asg-a", "eks:cluster-name": "inst-cluster",
+        "eks:nodegroup-name": "ng1", "Owner": "bob" },
+      { "Managed-By": "Datafy.io", "datafy:policy": "keep" } ],
+    "volumes": [
+      { "kubernetes.io/cluster/vol-cluster": "owned", "kubernetes.io/created-for/pvc/name": "pvc" },
+      { "ebs.csi.aws.com/cluster": "true" },
+      { "eks:cluster-name": "own-cluster" } ],
+    "snapshots": [ { "karpenter.sh/nodepool": "np", "Managed-By": "terraform" } ]
+  }
 }
 JSON
 
@@ -231,6 +242,58 @@ else
     fi
   done
 fi
+
+# ── Anonymization (SAAS-252) ───────────────────────────────────────────────────
+# The hashes are keyed, so three implementations only agree if they compute the
+# same digest from the same key. Pinning the key makes that checkable: with it,
+# the anonymized output and the mapping file must be identical across all three,
+# aliases and hashes included.
+echo
+echo "Comparing anonymized output (--anonymize-tags --anonymize-accounts)..."
+
+export DATAFY_ANONYMIZE_KEY_FILE="$WORK/parity.key"
+printf '%s\n' "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef" > "$DATAFY_ANONYMIZE_KEY_FILE"
+
+ANON_IMPLS=()
+for impl in "${IMPLS[@]}"; do
+  out="$WORK/${impl}.anon.json"
+  case "$impl" in
+    bash)   cmd=(bash "$ROOT/bash/discovery.sh" --output "$out") ;;
+    python) cmd=(python3 "$ROOT/python/discovery.py" --output "$out") ;;
+    go)     cmd=("$WORK/discovery-go" -output "$out") ;;
+  esac
+  if "${cmd[@]}" --anonymize-tags --anonymize-accounts >/dev/null 2>"$WORK/${impl}.anon.stderr"; then
+    normalize "$out" > "$WORK/${impl}.anon.norm.json"
+    jq -S 'del(.created_at) | del(.tool_version)' "$out.mapping.private" > "$WORK/${impl}.anon.mapping.json"
+    ANON_IMPLS+=("$impl")
+  else
+    fail "$impl: anonymized run completes" "$(tail -2 "$WORK/${impl}.anon.stderr" | head -1)"
+  fi
+done
+
+if [[ ${#ANON_IMPLS[@]} -ge 2 ]]; then
+  abase="${ANON_IMPLS[0]}"
+  for other in "${ANON_IMPLS[@]:1}"; do
+    if diff -u "$WORK/${abase}.anon.norm.json" "$WORK/${other}.anon.norm.json" > "$WORK/anon-diff-${other}.txt"; then
+      pass "$other: anonymized output matches $abase"
+    else
+      fail "$other: anonymized output matches $abase" "$(head -12 "$WORK/anon-diff-${other}.txt" | sed 's/^/      /')"
+    fi
+    if diff -u "$WORK/${abase}.anon.mapping.json" "$WORK/${other}.anon.mapping.json" > "$WORK/anon-mapdiff-${other}.txt"; then
+      pass "$other: mapping file matches $abase"
+    else
+      fail "$other: mapping file matches $abase" "$(head -12 "$WORK/anon-mapdiff-${other}.txt" | sed 's/^/      /')"
+    fi
+  done
+fi
+for impl in "${ANON_IMPLS[@]}"; do
+  if [[ "$(grep -Ecw '[0-9]{12}' "$WORK/${impl}.anon.json" || true)" == "0" ]]; then
+    pass "$impl: no account ID in the anonymized output"
+  else
+    fail "$impl: no account ID in the anonymized output" "a 12-digit ID survived"
+  fi
+done
+unset DATAFY_ANONYMIZE_KEY_FILE
 
 # ── The role template ──────────────────────────────────────────────────────────
 # All three deploy the same CloudFormation template with --setup-role, so all

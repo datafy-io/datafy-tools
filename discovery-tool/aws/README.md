@@ -164,6 +164,88 @@ By default the tool scans all accounts in the organization. Use these flags to n
 | `--include IDS` | Scan only these account IDs (comma-separated) |
 | `--exclude IDS` | Skip these account IDs (comma-separated) |
 
+## Anonymizing the output
+
+Some organizations would rather not share their tag values or account IDs. Two
+flags keep them out of the file. Both are **off by default** — without a flag the
+output is exactly what it was before — and they can be used separately or
+together. All three implementations take the same flags and produce the same
+output.
+
+| Flag | What it does |
+|---|---|
+| `--anonymize-tags` | Drops every tag except Datafy's own, and replaces them with a few derived fields. Cluster, node group and ASG names are hashed. |
+| `--anonymize-accounts` | Replaces each account ID with a stable alias (`acct-…`) everywhere in the output. |
+
+When either flag is used, the summary record says which were applied:
+`"anonymization": {"tags": true, "accounts": false}`.
+
+### `--anonymize-tags`
+
+Only the tag keys below are read; **every other tag is dropped** — on volumes,
+instances and snapshots, `Name` included. What remains on each resource is:
+
+| Output field | Taken from | Value in the output |
+|---|---|---|
+| `cluster` | `eks:cluster-name`, `aws:eks:cluster-name`, `eks:eks-cluster-name`, `ClusterName`, `KubernetesCluster`, `kubernetes.io/cluster/<name>` (the name is in the key), `ebs.csi.aws.com/cluster-name` | Hashed |
+| `node_group` | `eks:nodegroup-name`, `karpenter.sh/nodepool` | Hashed |
+| `asg` | `aws:autoscaling:groupName` | Hashed |
+| `is_k8s` | Any cluster or node group key above, or `ebs.csi.aws.com/cluster`, `CSIVolumeName`, `kubernetes.io/created-for/pv/name` | `true` / `false` |
+| `managed_by` | `eks:nodegroup-name` → `eks-nodegroup`; `aws:autoscaling:groupName` → `autoscaling-group`; `karpenter.sh/*` → `karpenter`; `cast:managed-by` or `autoscaling.cast.ai/*` → `cast.ai`; `kops.k8s.io/instancegroup` → `kops`; `sigs.k8s.io/cluster-api-provider-aws/*` → `cluster-api`; `aws:cloudformation:stack-name` → `cloudformation` | A fixed category; the tag's value isn't kept |
+| `Tags` | `Managed-By` = `Datafy.io`, and `datafy:*` | Kept as is |
+
+Keys are matched exactly (AWS tag keys are case-sensitive). Where several keys
+could supply a field, the first one in the order above wins. A volume inherits
+`cluster`, `node_group` and `asg` from the instance it is attached to, and its
+own tags override them; `is_k8s` is true if either the volume's tags or what it
+inherited mark it as Kubernetes. Fields with no source are `null` (`is_k8s`:
+`false`).
+
+Not read on purpose, so dropped: generic `Managed-By` / `managed-by` / `Terraform`
+keys (free-text values), `kubernetes.io/created-for/pvc/name` and
+`.../pvc/namespace` (the most sensitive values), `k8s.io/cluster-autoscaler/*`,
+`Environment`, `team`, `Owner`, `app`, and anything else not listed.
+
+> **Downside:** Datafy's analysis of your workloads is less accurate, because we
+> can no longer tell what workload a volume runs.
+
+### `--anonymize-accounts`
+
+Every account ID becomes an alias such as `acct-3fa91c0b27de`, and the same
+account gets the same alias on every record and on every run. This covers
+`account_id`, an instance's `OwnerId`, and any account ID inside an error message
+or ARN. Any other twelve-digit number in the output is aliased too — masking too
+much is the safe direction.
+
+> **Downside:** the aliases mean nothing on their own. To act on Datafy's results
+> you reconcile them with your accounts using the mapping file. The same applies
+> to the hashed cluster, node group and ASG names.
+
+### Hashing and the mapping file
+
+Cluster, node group and ASG names are replaced by a keyed hash (SHA-256 over a
+secret key, the kind of value and the value, shortened to 16 hex characters). The
+key is generated on your machine the first time you use a flag and kept in
+`~/.datafy-discovery/anonymize.key` (owner-only; override the location with
+`DATAFY_ANONYMIZE_KEY_FILE`), so the same name gets the same hash across runs.
+
+With either flag the tool also writes a **mapping file** next to the output —
+`<output>.mapping.private` — holding every alias and hash with its real value:
+
+```json
+{
+  "accounts":    { "acct-3fa91c0b27de": "123456789012" },
+  "clusters":    { "9c1e5a7d02b4f863": "prod-eks" },
+  "node_groups": { "…": "…" },
+  "asgs":        { "…": "…" }
+}
+```
+
+(`accounts` appears with `--anonymize-accounts`; the other three with
+`--anonymize-tags`.) The tool prints where it was written. **Keep it. Do not send
+it to Datafy** — it is not part of the output file, and it is the only way back
+from the aliases to the real values. The key file is just as private.
+
 ## Implementations
 
 Three implementations of the AWS edition, sharing one interface and one output
@@ -239,6 +321,10 @@ test one of the three.
 | `13_diagnostics_on_stderr` | The file is the only product; stdout stays clean |
 | `14_throttling_retried` | A throttled call is retried with backoff, and reported if it runs out |
 | `15_setup_role_template` | The role `--setup-role` deploys grants only what AWS will honour (DT-11548) |
+| `16_anonymize_tags` | `--anonymize-tags` drops every tag but Datafy's, derives cluster/node group/ASG/`is_k8s`/`managed_by`, hashes stably |
+| `17_anonymize_accounts` | `--anonymize-accounts` leaves no account ID anywhere — error text and `OwnerId` included |
+| `18_anonymize_off_by_default` | Without the flags the output is unchanged; `--help` documents both |
+| `19_anonymize_interrupt` | An interrupted anonymized run does not leak the IDs of accounts that never finished |
 
 ### The parity harness — `test/parity/`
 
@@ -246,7 +332,9 @@ Where the behavioural suite asks whether each implementation is *correct*, the
 parity harness asks whether they are *identical*: it runs one scenario through
 all three and diffs the normalised output line for line. That catches drift the
 per-case assertions would not think to look for — a renamed field, a differently
-rounded number, a reordered array.
+rounded number, a reordered array. It also runs all three with a pinned key and
+both anonymization flags, and requires the hashes, the aliases and the mapping
+file to match.
 
 ### The bash-internal suite — `bash/test/`
 
@@ -295,6 +383,10 @@ All three implementations share the same interface:
 --include    IDS    Comma-separated account IDs to scan
 --exclude    IDS    Comma-separated account IDs to skip
 --output     FILE   Output file (default: discovery_<timestamp>.json)
+--anonymize-tags    Drop every tag except Datafy's own; keep only hashed cluster/node
+                    group/ASG names plus is_k8s and managed_by
+--anonymize-accounts
+                    Replace account IDs with stable aliases everywhere in the output
 --print-role-template
                     Print the CloudFormation template --setup-role would deploy,
                     and exit. Contacts nothing and deploys nothing

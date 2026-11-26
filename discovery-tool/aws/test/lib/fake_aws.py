@@ -25,6 +25,10 @@ Scenario (a JSON file named by FAKE_AWS_SCENARIO):
 
       "volumes": 3, "instances": 2, "snapshots": 2, "ami_count": 3,
       "tag_pad": 0,            bytes of filler per tag value, to inflate payloads
+      "tags": {                extra tags per resource kind, cycled by index
+        "volumes": [{"eks:cluster-name": "prod"}, {}],
+        "instances": [], "snapshots": []
+      },
 
       "deny_assume": ["222222222222"],
       "deny": {                account/region -> denied actions, "*" for all
@@ -100,6 +104,14 @@ def pad_id(prefix, i):
     """Ids are built by zero-padding the index as a string; arithmetic on
     17-digit values silently degrades to a float in some JSON encoders."""
     return f"{prefix}{str(i).zfill(17)}"
+
+
+def extra_tags(kind, i):
+    """Tags a scenario adds to the i-th volume/instance/snapshot, on top of the
+    defaults. "tags": {"volumes": [{...}, {...}]} is cycled by index, so a case
+    can give a few resources specific tags and leave the rest alone."""
+    group = SCENARIO.get("tags", {}).get(kind) or []
+    return list(group[i % len(group)].items()) if group else []
 
 
 def tag_pad():
@@ -211,7 +223,7 @@ def describe_volumes(region, params):
             "<device>/dev/xvda</device><status>attached</status>"
             "</item></attachmentSet>"
             + tags_xml([("Name", f"volume-{i}{pad}"),
-                        ("Environment", f"env-{i % 7}{pad}")])
+                        ("Environment", f"env-{i % 7}{pad}")] + extra_tags("volumes", i))
             + "</item>"
         )
     return (
@@ -242,7 +254,7 @@ def describe_instances(region, account, params):
             "<architecture>x86_64</architecture><rootDeviceName>/dev/xvda</rootDeviceName>"
             f"<placement><availabilityZone>{esc(region)}a</availabilityZone></placement>"
             + tags_xml([("Name", f"instance-{i}{pad}"),
-                        ("Environment", f"env-{i % 7}{pad}")])
+                        ("Environment", f"env-{i % 7}{pad}")] + extra_tags("instances", i))
             + "</item></instancesSet></item>"
         )
     return (
@@ -265,7 +277,7 @@ def describe_snapshots(params):
             f"<volumeSize>{100 + (i % 900)}</volumeSize>"
             "<startTime>2026-01-01T00:00:00.000Z</startTime>"
             "<status>completed</status><encrypted>true</encrypted>"
-            + tags_xml([("Name", f"snapshot-{i}{pad}")])
+            + tags_xml([("Name", f"snapshot-{i}{pad}")] + extra_tags("snapshots", i))
             + "</item>"
         )
     return (
@@ -486,7 +498,10 @@ class Handler(BaseHTTPRequestHandler):
         Returns True when the call has already been answered.
         """
         if denied(account, region, action):
-            self._error("UnauthorizedOperation", f"mock denial for {action}",
+            # Real AWS denials name the caller's ARN, account ID included, which
+            # is what the account-anonymization cases look for in error text.
+            self._error("UnauthorizedOperation",
+                        f"mock denial for {action} (User: arn:aws:sts::{account}:assumed-role/Mock/session)",
                         service=service)
             return True
         if throttled(account, region, action):
@@ -564,7 +579,7 @@ class Handler(BaseHTTPRequestHandler):
                 arn = params.get("RoleArn", "")
                 target_account = arn.split("::")[1].split(":")[0] if "::" in arn else ""
                 if target_account in SCENARIO.get("deny_assume", []):
-                    self._error("AccessDenied", "mock denial", service="sts")
+                    self._error("AccessDenied", f"mock denial (not authorized to assume {arn})", service="sts")
                 else:
                     self._send(assume_role(arn))
             else:

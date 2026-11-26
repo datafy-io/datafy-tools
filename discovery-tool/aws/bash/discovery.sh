@@ -108,6 +108,10 @@ Options:
   --include    IDS    Comma-separated account IDs to scan
   --exclude    IDS    Comma-separated account IDs to skip
   --output     FILE   Output file (default: discovery_<timestamp>.json)
+  --anonymize-tags    Drop every tag except Datafy's own; keep only hashed cluster/node
+                      group/ASG names plus is_k8s and managed_by
+  --anonymize-accounts
+                      Replace account IDs with stable aliases everywhere in the output
   --version           Show version
   --help              Show this help
 EOF
@@ -318,6 +322,223 @@ region_record() {
       backup_plans: $backup_plans[0]}'
 }
 
+# ── Anonymization (--anonymize-tags, --anonymize-accounts) ─────────────────────
+# SAAS-252. Some customers do not want to share their tag values or account IDs
+# with Datafy. Everything here runs on the customer's machine, before a record
+# reaches the output, so the file that leaves the building never holds the real
+# values.
+#
+# The rules are identical in the Python and Go implementations, and the parity
+# harness holds all three to the same output byte for byte — change one, change
+# all three.
+
+ANON_TAGS=false
+ANON_ACCOUNTS=false
+ANON_KEY=""
+MAPPING_SUFFIX=".mapping.private"
+
+# SHA-256 of stdin, as lowercase hex. sha256sum on Linux, shasum on macOS.
+sha256_hex() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum | cut -d' ' -f1
+  elif command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 | cut -d' ' -f1
+  else
+    openssl dgst -sha256 | sed 's/^.*= *//'
+  fi
+}
+
+# The secret that keys every hash. Generated on first use and kept, so the same
+# name hashes the same way on later runs.
+load_or_create_key() {
+  local path="${DATAFY_ANONYMIZE_KEY_FILE:-$HOME/.datafy-discovery/anonymize.key}"
+  if [[ -e "$path" ]]; then
+    ANON_KEY=$(tr -d '[:space:]' < "$path" 2>/dev/null) || \
+      fail "cannot read the anonymization key $path"
+    (( ${#ANON_KEY} >= 32 )) || \
+      fail "the anonymization key in $path is too short — delete the file to generate a new one"
+    return 0
+  fi
+
+  local key
+  key=$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')
+  mkdir -p -m 700 "$(dirname "$path")" 2>/dev/null || \
+    fail "cannot create the directory for the anonymization key $path (set DATAFY_ANONYMIZE_KEY_FILE to use another location)"
+  # noclobber makes the redirect an exclusive create, so two runs starting at
+  # once cannot overwrite each other's key.
+  if ( umask 077; set -o noclobber; printf '%s\n' "$key" > "$path" ) 2>/dev/null; then
+    ANON_KEY="$key"
+  elif [[ -s "$path" ]]; then
+    ANON_KEY=$(tr -d '[:space:]' < "$path")
+  else
+    fail "cannot write the anonymization key $path (set DATAFY_ANONYMIZE_KEY_FILE to use another location)"
+  fi
+}
+
+# The stable stand-in for a real value. SHA-256 over "<key>\n<kind>\n<value>":
+# the key is a 256-bit secret, so without it a name cannot be recovered by
+# hashing guesses, and the kind keeps a cluster and an ASG of the same name from
+# colliding. Python and Go compute exactly the same thing.
+alias_for() {
+  local kind="$1" real="$2" digest
+  digest=$(printf '%s\n%s\n%s' "$ANON_KEY" "$kind" "$real" | sha256_hex)
+  if [[ "$kind" == "account" ]]; then
+    printf 'acct-%s' "${digest:0:12}"
+  else
+    printf '%s' "${digest:0:16}"
+  fi
+}
+
+# TSV lines "kind<TAB>real" on stdin -> "kind<TAB>real<TAB>alias" on stdout.
+alias_lines() {
+  local kind real
+  while IFS=$'\t' read -r kind real; do
+    [[ -n "$kind" && -n "$real" ]] || continue
+    printf '%s\t%s\t%s\n' "$kind" "$real" "$(alias_for "$kind" "$real")"
+  done
+}
+
+# Tags. facts() reads what a resource's tags say; the rest assembles the output.
+# Where several keys could supply a field, the first one present wins. A volume
+# inherits cluster, node group and ASG from the instance it is attached to, and
+# its own tags override. Every other tag is dropped, Name included.
+ANON_TAGS_JQ='
+def facts:
+  (reduce .[] as $t ({}; .[$t.Key] = $t.Value)) as $v
+  | ($v | keys) as $keys
+  | def present($k): $v | has($k);
+    def pre($p): any($keys[]; startswith($p));
+    "kubernetes.io/cluster/" as $kp
+  | ($keys | map(select(startswith($kp) and length > ($kp | length))) | sort) as $named
+  | ["eks:cluster-name","aws:eks:cluster-name","eks:eks-cluster-name","ClusterName","KubernetesCluster"] as $ck
+  | ["eks:nodegroup-name","karpenter.sh/nodepool"] as $nk
+  | ["ebs.csi.aws.com/cluster","CSIVolumeName","kubernetes.io/created-for/pv/name"] as $mk
+  | ([ $ck[] | select(present(.)) | $v[.] ]
+     + [ $named[0] // empty | ltrimstr($kp) ]
+     + [ $v["ebs.csi.aws.com/cluster-name"] // empty ]
+     | map(select(. != "")) | first // "") as $cluster
+  | ([ $nk[] | select(present(.)) | $v[.] ] | map(select(. != "")) | first // "") as $ng
+  | (any($ck[]; present(.)) or ($named | length > 0) or present("ebs.csi.aws.com/cluster-name")
+     or any($nk[]; present(.)) or any($mk[]; present(.))) as $k8s
+  | { cluster: $cluster, node_group: $ng, asg: ($v["aws:autoscaling:groupName"] // ""), k8s: $k8s,
+      managed_by: (
+        if   present("eks:nodegroup-name")             then "eks-nodegroup"
+        elif present("aws:autoscaling:groupName")      then "autoscaling-group"
+        elif pre("karpenter.sh/")                      then "karpenter"
+        elif present("cast:managed-by") or pre("autoscaling.cast.ai/") then "cast.ai"
+        elif present("kops.k8s.io/instancegroup")      then "kops"
+        elif pre("sigs.k8s.io/cluster-api-provider-aws/") then "cluster-api"
+        elif present("aws:cloudformation:stack-name")  then "cloudformation"
+        else null end) };
+
+def blank: if . == "" then null else . end;
+def fields($f):
+  { cluster: ($f.cluster | blank), node_group: ($f.node_group | blank), asg: ($f.asg | blank),
+    is_k8s: ($f.k8s or $f.cluster != "" or $f.node_group != ""), managed_by: $f.managed_by };
+def datafy: map(select((.Key == "Managed-By" and .Value == "Datafy.io") or (.Key | startswith("datafy:"))));
+
+(($insts[0] | map({key: .InstanceId, value: (.Tags | facts)}) | from_entries) as $byi
+ | {
+   volumes: ($vols[0] | map(
+     (.Tags | facts) as $f
+     | ($byi[.InstanceId // ""] // null) as $p
+     | (if $p then $f
+          | .cluster    |= (if . == "" then $p.cluster    else . end)
+          | .node_group |= (if . == "" then $p.node_group else . end)
+          | .asg        |= (if . == "" then $p.asg        else . end)
+        else $f end) as $m
+     | . + fields($m) | .Tags |= datafy | .Name = null)),
+   instances: ($insts[0] | map((.Tags | facts) as $f | . + fields($f) | .Tags |= datafy | .Name = null)),
+   snapshots: ($snaps[0] | map((.Tags | facts) as $f | . + fields($f) | .Tags |= datafy))
+ })'
+
+# Second pass: swap each real name for its hash.
+ANON_ALIAS_JQ='
+def al($kind): if . == null then null else ($m[0][$kind][.] // error("no alias for a " + $kind)) end;
+(.volumes, .instances, .snapshots) |= map(
+  .cluster |= al("cluster") | .node_group |= al("node_group") | .asg |= al("asg"))'
+
+# Replace every tag on the volumes, instances and snapshots in $tmp with the
+# derived fields. On failure the three arrays are emptied: a region that could
+# not be anonymized is reported as degraded, never emitted with its tags.
+# Hash pairings go to $REGION_MAP_FILE for the mapping file.
+anonymize_tags() {
+  local tmp="$1" err_log="$2"
+  local stage="$tmp/anon_stage.json" names="$tmp/anon_names.tsv" pairs="$tmp/anon_pairs.tsv"
+  local amap="$tmp/anon_map.json" done_json="$tmp/anon_done.json"
+
+  if jq -n \
+       --slurpfile vols "$tmp/out_volumes.json" \
+       --slurpfile insts "$tmp/out_instances.json" \
+       --slurpfile snaps "$tmp/out_snapshots.json" \
+       "$ANON_TAGS_JQ" > "$stage" 2>/dev/null \
+     && jq -r '[(.volumes[], .instances[], .snapshots[]) as $r
+                | ("cluster", "node_group", "asg") as $k
+                | select($r[$k] != null) | "\($k)\t\($r[$k])"] | unique | .[]' \
+          "$stage" > "$names" 2>/dev/null \
+     && alias_lines < "$names" > "$pairs" \
+     && jq -R -s 'split("\n") | map(select(length > 0) | split("\t"))
+                  | reduce .[] as $r ({}; .[$r[0]][$r[1]] = $r[2])' "$pairs" > "$amap" 2>/dev/null \
+     && jq --slurpfile m "$amap" "$ANON_ALIAS_JQ" "$stage" > "$done_json" 2>/dev/null \
+     && jq '.volumes'   "$done_json" > "$tmp/out_volumes.json.new"   \
+     && jq '.instances' "$done_json" > "$tmp/out_instances.json.new" \
+     && jq '.snapshots' "$done_json" > "$tmp/out_snapshots.json.new"; then
+    mv -f "$tmp/out_volumes.json.new"   "$tmp/out_volumes.json"
+    mv -f "$tmp/out_instances.json.new" "$tmp/out_instances.json"
+    mv -f "$tmp/out_snapshots.json.new" "$tmp/out_snapshots.json"
+    [[ -n "${REGION_MAP_FILE:-}" ]] && cat "$pairs" >> "$REGION_MAP_FILE"
+    return 0
+  fi
+
+  echo "[]" > "$tmp/out_volumes.json"
+  echo "[]" > "$tmp/out_instances.json"
+  echo "[]" > "$tmp/out_snapshots.json"
+  printf '%s\n' "anonymize tags: could not anonymize this region's tags, so its inventory was withheld" >> "$err_log"
+  return 1
+}
+
+# Replace every account ID in a JSONL file with its alias, in place.
+#
+# Works on the text, so nothing is missed: account_id fields, an instance's
+# OwnerId, and the account IDs AWS embeds in error messages and ARNs are all just
+# twelve digits. A twelve-digit run that is not an account is aliased too —
+# over-masking is the safe direction, and the mapping file has it.
+# Pairings are appended to MAP_FILE as "account<TAB>real<TAB>alias".
+scrub_accounts_file() {
+  local file="$1" map_file="$2"
+  local pairs="${file}.ids" amap="${file}.idmap"
+
+  jq -Rr '[match("\\b[0-9]{12}\\b"; "g").string] | .[]' "$file" 2>/dev/null \
+    | sort -u | sed 's/^/account\t/' | alias_lines > "$pairs" || return 1
+  jq -R -s 'split("\n") | map(select(length > 0) | split("\t")) | reduce .[] as $r ({}; .[$r[1]] = $r[2])' \
+    "$pairs" > "$amap" 2>/dev/null || return 1
+  jq -Rr --slurpfile m "$amap" 'gsub("\\b(?<id>[0-9]{12})\\b"; $m[0][.id])' "$file" > "${file}.scrubbed" 2>/dev/null \
+    || return 1
+  mv -f "${file}.scrubbed" "$file"
+  cat "$pairs" >> "$map_file"
+  rm -f "$pairs" "$amap"
+}
+
+# The mapping file: every alias and hash with the real value behind it. Only the
+# sections for the options that were used are present.
+write_mapping_file() {
+  local dest="$1" created_at="$2"
+  shift 2
+  # Remaining arguments: the .map files collected from the scans.
+  local combined
+  combined=$(cat "$@" 2>/dev/null || true)
+  printf '%s\n' "$combined" | jq -R -s -S \
+    --arg tool_version "$VERSION" --arg created_at "$created_at" \
+    --argjson tags "$ANON_TAGS" --argjson accounts "$ANON_ACCOUNTS" '
+    (split("\n") | map(select(length > 0) | split("\t"))
+      | reduce .[] as $r ({}; .[$r[0]][$r[2]] = $r[1])) as $m
+    | { note: "PRIVATE: maps the anonymized values in the discovery output back to the real ones. Keep this file; do not send it to Datafy.",
+        tool_version: $tool_version, created_at: $created_at }
+      + (if $accounts then { accounts: ($m.account // {}) } else {} end)
+      + (if $tags then { clusters: ($m.cluster // {}), node_groups: ($m.node_group // {}),
+                         asgs: ($m.asg // {}) } else {} end)' > "$dest"
+}
+
 # ── Per-region scan ────────────────────────────────────────────────────────────
 
 # Look up every AMI referenced by the instances in this region, in batches.
@@ -445,6 +666,10 @@ scan_region() {
     '[.[]? | {BackupPlanId, BackupPlanName,
       CreationDate: (.CreationDate // "" | sub("\\+00:00$"; "Z"))}]' || failures=$(( failures + 1 ))
 
+  if [[ "$ANON_TAGS" == true ]]; then
+    anonymize_tags "$tmp" "$err_log" || failures=$(( failures + 1 ))
+  fi
+
   local status="ok"
   if (( failures > 0 )); then
     if (( failures >= calls )); then status="failed"; else status="partial"; fi
@@ -467,7 +692,7 @@ scan_region() {
 #
 # Always returns 0: an unreachable account is reported as a record, not as a
 # non-zero status that the caller would have to guess the meaning of.
-scan_account() {
+scan_account_records() {
   local account_id="$1" caller_account_id="$2" role_name="$3" result_file="$4"
 
   # Assume role in child accounts
@@ -536,6 +761,7 @@ scan_account() {
     throttle_region_jobs
     (
       [[ -n "$role_env" ]] && eval "$role_env"
+      REGION_MAP_FILE="${tmp_dir}/${region}.map"
       # Write under a staging name and rename into place. A job killed mid-write
       # then leaves a .partial file that the collector ignores, instead of a
       # truncated record that would corrupt the JSONL.
@@ -582,6 +808,8 @@ scan_account() {
     fi
   done
   mv -f "${result_file}.partial" "$result_file"
+  # Tag hash pairings from this account's regions, for the mapping file.
+  cat "${tmp_dir}"/*.map > "${result_file%.jsonl}.map" 2>/dev/null || true
   rm -rf "$tmp_dir"
 
   # Name the regions, not just the count — "3 failed" gives the operator nothing
@@ -589,6 +817,24 @@ scan_account() {
   log "  [done] $account_id — $count regions"
   [[ -n "$partial_regions" ]] && log "         partial: $partial_regions"
   [[ -n "$failed_regions"  ]] && log "         failed:  $failed_regions"
+  return 0
+}
+
+# scan_account, plus --anonymize-accounts: whatever the scan wrote for the
+# account is scrubbed of account IDs before the parent ever sees it. If it cannot
+# be scrubbed it is replaced by a failed-account record that names only the alias
+# — raw IDs must never reach the output.
+scan_account() {
+  local account_id="$1" result_file="$4"
+  scan_account_records "$@" || true
+  if [[ "$ANON_ACCOUNTS" == true && -s "$result_file" ]]; then
+    scrub_accounts_file "$result_file" "${result_file%.jsonl}.map" || {
+      account_record "$(alias_for account "$account_id")" "failed" \
+        "account anonymization failed, so its inventory was withheld" > "$result_file"
+      printf 'account\t%s\t%s\n' "$account_id" "$(alias_for account "$account_id")" \
+        >> "${result_file%.jsonl}.map"
+    }
+  fi
   return 0
 }
 
@@ -749,6 +995,8 @@ while [[ $# -gt 0 ]]; do
     --include)    INCLUDE="$2";     shift 2 ;;
     --exclude)    EXCLUDE="$2";     shift 2 ;;
     --output)     OUTPUT="$2";      shift 2 ;;
+    --anonymize-tags)     ANON_TAGS=true;     shift ;;
+    --anonymize-accounts) ANON_ACCOUNTS=true; shift ;;
     --version)    echo "Datafy Discovery Tool v${VERSION}"; exit 0 ;;
     # Reviewing the template is the whole point of this flag, so it goes to
     # stdout where it can be piped or redirected — the same exception --version
@@ -770,6 +1018,15 @@ done
 for dep in aws jq; do
   command -v "$dep" &>/dev/null || fail "'$dep' is required but not installed."
 done
+
+if [[ "$ANON_TAGS" == true || "$ANON_ACCOUNTS" == true ]]; then
+  command -v sha256sum >/dev/null 2>&1 || command -v shasum >/dev/null 2>&1 \
+    || command -v openssl >/dev/null 2>&1 \
+    || fail "anonymization needs one of sha256sum, shasum or openssl to hash names."
+  # Resolved before anything is scanned: a key that cannot be read or created
+  # is worth failing on now, not after an hour of API calls.
+  load_or_create_key
+fi
 
 # ── Main ───────────────────────────────────────────────────────────────────────
 
@@ -869,6 +1126,15 @@ log "Accounts to scan: ${#ACCOUNTS[@]}"
 : > "$OUTPUT" 2>/dev/null || \
   fail "cannot write output file '$OUTPUT' — check the directory exists and is writable."
 
+# The mapping file stays with the customer. Created up front, empty and
+# owner-only, so an unwritable location fails now rather than at the end.
+MAPPING_FILE=""
+if [[ "$ANON_TAGS" == true || "$ANON_ACCOUNTS" == true ]]; then
+  MAPPING_FILE="${OUTPUT}${MAPPING_SUFFIX}"
+  ( umask 077; : > "$MAPPING_FILE" ) 2>/dev/null || \
+    fail "cannot create the mapping file '$MAPPING_FILE' — check the directory is writable."
+fi
+
 # Per-account result files, concatenated into $OUTPUT once every job is done.
 RESULT_DIR=$(make_tmpdir 2>/dev/null) || \
   fail "cannot create a temp directory under '${TMPDIR:-/tmp}' — set TMPDIR to a writable location."
@@ -890,11 +1156,18 @@ finalize_output() {
   local reason="account scan produced no result (process terminated)"
   [[ "$INTERRUPTED" == true ]] && reason="run interrupted before this account finished"
 
-  local account
+  # Accounts that never reported are still named. Staged in a file of their own
+  # so --anonymize-accounts can scrub them before they join the output.
+  local unreported="${RESULT_DIR}/unreported.jsonl" account
+  : > "$unreported"
   for account in "${ACCOUNTS[@]+"${ACCOUNTS[@]}"}"; do
     [[ -s "${RESULT_DIR}/${account}.jsonl" ]] && continue
-    account_record "$account" "failed" "$reason" >> "$OUTPUT"
+    account_record "$account" "failed" "$reason" >> "$unreported"
   done
+  if [[ "$ANON_ACCOUNTS" == true && -s "$unreported" ]]; then
+    scrub_accounts_file "$unreported" "${RESULT_DIR}/unreported.map" || : > "$unreported"
+  fi
+  cat "$unreported" >> "$OUTPUT"
 
   # Tally in one streaming pass — the output can be gigabytes, so it is never
   # slurped into memory.
@@ -930,18 +1203,31 @@ finalize_output() {
     --argjson regions_scanned   "$ok" \
     --argjson regions_partial   "$partial" \
     --argjson regions_failed    "$region_failed" \
+    --argjson anon              "$([[ "$ANON_TAGS" == true || "$ANON_ACCOUNTS" == true ]] && echo true || echo false)" \
+    --argjson anon_tags         "$ANON_TAGS" \
+    --argjson anon_accounts     "$ANON_ACCOUNTS" \
     '{record_type: "summary", tool_version: $tool_version, scanned_at: $scanned_at,
       interrupted: $interrupted,
       accounts_total: $accounts_total, accounts_scanned: $accounts_scanned,
       accounts_skipped: $accounts_skipped, accounts_failed: $accounts_failed,
       regions_scanned: $regions_scanned, regions_partial: $regions_partial,
-      regions_failed: $regions_failed}' >> "$OUTPUT"
+      regions_failed: $regions_failed}
+     + (if $anon then {anonymization: {tags: $anon_tags, accounts: $anon_accounts}} else {} end)' >> "$OUTPUT"
+
+  if [[ -n "$MAPPING_FILE" ]]; then
+    write_mapping_file "$MAPPING_FILE" "$(now_utc)" "$RESULT_DIR"/*.map \
+      || log "Warning: could not write the mapping file $MAPPING_FILE"
+  fi
 
   log ""
   [[ "$INTERRUPTED" == true ]] && log "Run was interrupted — the results below are partial."
   log "Accounts: $total total, $scanned scanned, $skipped skipped, $failed failed"
   log "Regions:  $ok scanned, $partial partial, $region_failed failed"
   log "Output:   $OUTPUT"
+  if [[ -n "$MAPPING_FILE" ]]; then
+    log "Mapping:  $MAPPING_FILE"
+    log "          Maps the anonymized values back to the real ones. Keep it — do NOT send it to Datafy."
+  fi
   if (( skipped > 0 || failed > 0 || partial > 0 || region_failed > 0 )); then
     log ""
     log "Some accounts or regions were not fully scanned. Every one is recorded in"
